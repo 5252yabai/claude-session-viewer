@@ -1,0 +1,2375 @@
+#!/usr/bin/env python3
+"""ccs - Claude Code Session viewer.
+
+~/.claude/projects/<project>/*.jsonl 을 읽어 브라우저로 열람하고,
+공유용 self-contained HTML 로 내보낸다.
+
+  ccs serve                 현재 프로젝트 세션을 로컬 서버로 열람
+  ccs serve --all           모든 프로젝트
+  ccs list                  세션 목록만 출력
+  ccs export <id> -o a.html 세션 하나를 self-contained HTML 로 저장
+"""
+
+import argparse
+import html
+import json
+import os
+import re
+import socketserver
+import sys
+import threading
+import webbrowser
+from datetime import datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import unquote, urlparse
+
+HOME = os.path.expanduser("~")
+PROJECTS_ROOT = os.path.join(HOME, ".claude", "projects")
+MAX_STR = 12000  # 문자열 파트 1개당 상한
+TITLE_SCAN_LINES = 3000
+
+
+# ---------------------------------------------------------------- discovery
+
+
+def project_dir_for(cwd):
+    """/Users/a/b -> ~/.claude/projects/-Users-a-b"""
+    slug = cwd.replace("/", "-")
+    return os.path.join(PROJECTS_ROOT, slug)
+
+
+def all_project_dirs():
+    if not os.path.isdir(PROJECTS_ROOT):
+        return []
+    return sorted(
+        os.path.join(PROJECTS_ROOT, d)
+        for d in os.listdir(PROJECTS_ROOT)
+        if os.path.isdir(os.path.join(PROJECTS_ROOT, d))
+    )
+
+
+def resolve_dirs(args):
+    if getattr(args, "dir", None):
+        return [os.path.abspath(os.path.expanduser(args.dir))]
+    if getattr(args, "all", False):
+        return all_project_dirs()
+    d = project_dir_for(os.getcwd())
+    if os.path.isdir(d):
+        return [d]
+    every = all_project_dirs()
+    if not every:
+        sys.exit("세션이 하나도 없습니다: %s" % PROJECTS_ROOT)
+    print("현재 위치에 세션 없음 → 전체 프로젝트 %d개로 대체" % len(every), file=sys.stderr)
+    return every
+
+
+def scan_sessions(dirs):
+    """세션 파일 전체를 파싱하지 않고 목록용 요약만 만든다."""
+    out = []
+    for d in dirs:
+        if not os.path.isdir(d):
+            continue
+        project = os.path.basename(d)
+        for name in os.listdir(d):
+            if not name.endswith(".jsonl"):
+                continue
+            path = os.path.join(d, name)
+            try:
+                st = os.stat(path)
+            except OSError:
+                continue
+            if st.st_size == 0:
+                continue
+            meta = peek(path)
+            last_cwd, last_branch = peek_tail(path)
+            out.append(
+                {
+                    "id": name[:-6],
+                    "path": path,
+                    "project": os.path.basename(meta["cwd"]) or project,
+                    "size": st.st_size,
+                    "mtime": st.st_mtime,
+                    "title": meta["title"],
+                    "cwd": meta["cwd"],
+                    "cwd_last": last_cwd or meta["cwd"],
+                    "branch": last_branch or meta["branch"],
+                    "started": meta["started"],
+                }
+            )
+    # 표시하는 값(시작 시각)과 정렬 기준을 맞춘다. 시작 시각이 없으면 mtime 으로.
+    out.sort(key=lambda s: (s["started"] or "", s["mtime"]), reverse=True)
+    return out
+
+
+def peek(path):
+    """앞부분만 읽어 제목/브랜치/시작시각을 뽑는다."""
+    title, fallback, cwd, branch, started = "", "", "", "", ""
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for n, line in enumerate(f):
+                if n > TITLE_SCAN_LINES:
+                    break
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    e = json.loads(line)
+                except ValueError:
+                    continue
+                if not started:
+                    started = e.get("timestamp") or ""
+                cwd = cwd or e.get("cwd") or ""
+                branch = branch or e.get("gitBranch") or ""
+                if title or e.get("type") != "user" or e.get("isSidechain"):
+                    continue
+                if e.get("isMeta"):
+                    continue
+                cand, bare = prompt_title(first_text(e.get("message", {})))
+                if cand:
+                    title = cand
+                    if started:
+                        break
+                elif bare and not fallback:
+                    fallback = bare
+    except OSError:
+        pass
+    return {
+        "title": title or fallback or "(제목 없음)",
+        "cwd": cwd,
+        "branch": branch,
+        "started": started,
+    }
+
+
+def peek_tail(path, size=65536):
+    """끝부분만 읽어 마지막 cwd/브랜치를 뽑는다 (세션 중 워크트리 이동·체크아웃 대응)."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            f.seek(max(0, f.tell() - size))
+            chunk = f.read().decode("utf-8", "replace")
+    except OSError:
+        return "", ""
+    cwd = branch = ""
+    for line in reversed(chunk.splitlines()):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            e = json.loads(line)
+        except ValueError:
+            continue
+        cwd = cwd or e.get("cwd") or ""
+        branch = branch or e.get("gitBranch") or ""
+        if cwd and branch:
+            break
+    return cwd, branch
+
+
+def first_text(message):
+    c = message.get("content")
+    if isinstance(c, str):
+        return c
+    if isinstance(c, list):
+        for p in c:
+            if isinstance(p, dict) and p.get("type") == "text":
+                return p.get("text") or ""
+    return ""
+
+
+NOISE_RE = re.compile(
+    r"<(system-reminder|command-message|command-name|command-args"
+    r"|local-command-\w+|task-notification)>.*?</\1>",
+    re.S,
+)
+CMD_RE = re.compile(r"<command-name>\s*(.*?)\s*</command-name>", re.S)
+CMD_ARGS_RE = re.compile(r"<command-args>\s*(.*?)\s*</command-args>", re.S)
+STDOUT_RE = re.compile(r"<local-command-stdout>(.*?)</local-command-stdout>", re.S)
+SKIP_TITLES = ("[Request interrupted by user]", "[Request interrupted by user for tool use]")
+SKILL_PREFIX = "Base directory for this skill: "
+
+
+def strip_noise(text):
+    return NOISE_RE.sub("", text or "")
+
+
+CONTINUED_PREFIX = "This session is being continued"
+INTERRUPT_PREFIX = "[Request interrupted"
+
+
+def opens_turn(content):
+    """진짜 지시만 턴을 연다. (04 결정 — 진행바 분모·턴 번호·sticky 라벨의 공통 재료)
+
+    /명령 단독 · compact 승계문 · <…> 시스템 주입 · [Request interrupted…] 는
+    턴을 열지 않고 앞 턴에 속한다.
+    """
+    if any(isinstance(p, dict) and p.get("type") == "tool_result" for p in content):
+        return False
+    texts = [p.get("text") or "" for p in content
+             if isinstance(p, dict) and p.get("type") == "text"]
+    if not texts:
+        return False
+    body = strip_noise("\n".join(texts)).strip()
+    return bool(body) and not body.startswith(
+        ("/", "<", CONTINUED_PREFIX, INTERRUPT_PREFIX)
+    )
+
+
+def prompt_title(raw):
+    """유저 메시지에서 (제목, 대체제목)을 뽑는다.
+
+    인자 없는 슬래시 커맨드(/clear, /model …)는 제목감이 아니라 대체제목으로만 쓴다.
+    """
+    raw = raw or ""
+    cmd = CMD_RE.search(raw)
+    if cmd:
+        args = CMD_ARGS_RE.search(raw)
+        name = " ".join(cmd.group(1).split())
+        arg = " ".join(args.group(1).split()) if args else ""
+        if not arg:
+            return "", name[:120]
+        return ("%s %s" % (name, arg))[:120], ""
+    text = " ".join(strip_noise(raw).split())
+    if not text or text in SKIP_TITLES:
+        return "", ""
+    return text[:120], ""
+
+
+def _cwd_label(cwd, sessions):
+    if not cwd:
+        return sessions[0]["project"]
+    if cwd == HOME:
+        return "~"
+    if cwd.startswith(HOME + "/"):
+        return "~" + cwd[len(HOME):]
+    return cwd
+
+
+GIT_WT_MARKER = "/.git/worktrees/"
+
+
+def _gitdir_repo(git_file, at):
+    """워크트리 .git 파일의 gitdir 포인터에서 원본 repo 루트를 뽑는다."""
+    try:
+        with open(git_file, encoding="utf-8", errors="replace") as f:
+            line = f.readline().strip()
+    except OSError:
+        return ""
+    if not line.startswith("gitdir:"):
+        return ""
+    gd = line[len("gitdir:"):].strip()
+    if not os.path.isabs(gd):
+        gd = os.path.normpath(os.path.join(at, gd))
+    i = gd.find(GIT_WT_MARKER)
+    return gd[:i] if i > 0 else ""
+
+
+def _resolve_repo(cwd):
+    """cwd에서 상향탐색하며 .git을 찾아 (repo 루트, 워크트리 디렉토리)를 돌려준다.
+
+    .git 디렉토리면 메인 repo, gitdir 포인터 파일이면 워크트리.
+    git 서브프로세스보다 ~300배 싸고 결과는 같다. 미판별은 ("", "").
+    """
+    d = cwd
+    while d and d != "/":
+        g = os.path.join(d, ".git")
+        if os.path.isdir(g):
+            return d, ""
+        if os.path.isfile(g):
+            root = _gitdir_repo(g, d)
+            if root:
+                return root, d
+        d = os.path.dirname(d)
+    return "", ""
+
+
+def _worktree_index(roots):
+    """repo 쪽 .git/worktrees/*/gitdir 역인덱스: 삭제된 워크트리 경로 -> repo."""
+    idx = {}
+    for root in roots:
+        wt_dir = os.path.join(root, ".git", "worktrees")
+        try:
+            names = os.listdir(wt_dir)
+        except OSError:
+            continue
+        for n in names:
+            try:
+                with open(os.path.join(wt_dir, n, "gitdir")) as f:
+                    p = f.read().strip()
+            except OSError:
+                continue
+            if p.endswith("/.git"):
+                idx[p[: -len("/.git")]] = root
+    return idx
+
+
+def _heuristic_repo(cwd, roots):
+    """워크트리 생성 규칙 역산: <repo>/.claude/worktrees → herdr → ~/.wt 최장 prefix."""
+    i = cwd.find("/.claude/worktrees/")
+    if i > 0:
+        name = cwd[i + len("/.claude/worktrees/"):].split("/", 1)[0]
+        return cwd[:i], cwd[:i] + "/.claude/worktrees/" + name
+    by_name = {os.path.basename(r): r for r in roots}
+    herdr = HOME + "/.herdr/worktrees/"
+    if cwd.startswith(herdr):
+        segs = cwd[len(herdr):].split("/")
+        if len(segs) >= 2 and segs[0] in by_name:
+            return by_name[segs[0]], herdr + segs[0] + "/" + segs[1]
+    wt = HOME + "/.wt/"
+    if cwd.startswith(wt):
+        leaf = cwd[len(wt):].split("/", 1)[0]
+        best = ""
+        for name in by_name:
+            if (leaf == name or leaf.startswith(name + "-")) and len(name) > len(best):
+                best = name
+        if best:
+            return by_name[best], wt + leaf
+    return "", ""
+
+
+def group_sessions(sessions):
+    """같은 repo의 메인·워크트리 세션을 한 그룹으로 묶는다. 그룹 안 최신순 유지.
+
+    판별 순서: .git 상향탐색 → repo 역인덱스(삭제된 워크트리) → 경로 휴리스틱
+    → 미판별은 cwd 단독 그룹. 워크트리 세션에는 wt(디렉토리명) 배지를 단다.
+    """
+    repo = {}  # cwd -> (repo 루트, 워크트리 디렉토리)
+    for s in sessions:
+        cwd = s.get("cwd_last") or s["cwd"]
+        if cwd and cwd not in repo:
+            repo[cwd] = _resolve_repo(cwd)
+    known = sorted({r for r, _ in repo.values() if r})
+    idx = None
+    for cwd, (root, _) in list(repo.items()):
+        if root:
+            continue
+        if idx is None:
+            idx = _worktree_index(known)
+        hit = next(
+            ((r, w) for w, r in idx.items() if cwd == w or cwd.startswith(w + "/")),
+            None,
+        )
+        repo[cwd] = hit or _heuristic_repo(cwd, known)
+    by_root = {}
+    for s in sessions:
+        cwd = s.get("cwd_last") or s["cwd"]
+        root, wt = repo.get(cwd, ("", ""))
+        s["wt"] = os.path.basename(wt) if root and wt else ""
+        by_root.setdefault(root or cwd, []).append(s)
+    groups = [
+        {"label": _cwd_label(key, ss), "sessions": ss}
+        for key, ss in by_root.items()
+    ]
+    # scan_sessions 와 같은 최신순 기준: 그룹의 가장 최근 세션이 위로.
+    groups.sort(
+        key=lambda g: max((s["started"] or "", s["mtime"]) for s in g["sessions"]),
+        reverse=True,
+    )
+    return groups
+
+
+# ------------------------------------------------------------------ parsing
+
+
+def clip(s):
+    if not isinstance(s, str):
+        s = json.dumps(s, ensure_ascii=False)
+    if len(s) > MAX_STR:
+        return s[:MAX_STR] + "\n\n… (%s자 잘림)" % (len(s) - MAX_STR)
+    return s
+
+
+def result_text(content):
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        chunks = []
+        for p in content:
+            if not isinstance(p, dict):
+                chunks.append(str(p))
+            elif p.get("type") == "text":
+                chunks.append(p.get("text") or "")
+            elif p.get("type") == "image":
+                chunks.append("(이미지)")
+            else:
+                chunks.append(json.dumps(p, ensure_ascii=False))
+        return "\n".join(chunks)
+    if content is None:
+        return ""
+    return json.dumps(content, ensure_ascii=False)
+
+
+def file_diff_part(tool, tur, is_error):
+    """Edit/Write 성공 결과의 toolUseResult -> diff 렌더용 파트. 아니면 None."""
+    if tool not in ("Edit", "Write") or is_error or not isinstance(tur, dict):
+        return None
+    part = {
+        "type": "file_diff",
+        "tool": tool,
+        "file": tur.get("filePath") or "",
+        "patch": tur.get("structuredPatch") or [],
+        "create": tur.get("type") == "create",
+        "userModified": bool(tur.get("userModified")),
+    }
+    if part["create"]:
+        part["content"] = clip(tur.get("content") or "")
+    return part
+
+
+def _agent_file_diffs(path):
+    """서브에이전트 jsonl에서 Edit/Write 성공 diff 파트만 뽑는다."""
+    diffs, ts, names = [], "", {}
+    try:
+        f = open(path, "r", encoding="utf-8", errors="replace")
+    except OSError:
+        return diffs, ts
+    with f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                e = json.loads(line)
+            except ValueError:
+                continue
+            content = (e.get("message") or {}).get("content")
+            if not isinstance(content, list):
+                continue
+            for p in content:
+                if not isinstance(p, dict):
+                    continue
+                if p.get("type") == "tool_use":
+                    names[p.get("id")] = p.get("name")
+                elif p.get("type") == "tool_result":
+                    fd = file_diff_part(
+                        names.get(p.get("tool_use_id"), ""),
+                        e.get("toolUseResult"),
+                        bool(p.get("is_error")),
+                    )
+                    if fd:
+                        diffs.append(fd)
+                        ts = e.get("timestamp") or ts
+    return diffs, ts
+
+
+def _subagent_events(session_path, tool_turns, last_turn):
+    """<sessionId>/subagents/agent-*.jsonl -> 부모 턴에 붙일 사이드체인 이벤트."""
+    sub = os.path.join(session_path[:-6], "subagents")
+    try:
+        names = sorted(n for n in os.listdir(sub) if n.endswith(".jsonl"))
+    except OSError:
+        return []
+    out = []
+    for n in names:
+        try:
+            with open(os.path.join(sub, n[:-6] + ".meta.json")) as f:
+                meta = json.load(f)
+        except (OSError, ValueError):
+            meta = {}
+        diffs, ts = _agent_file_diffs(os.path.join(sub, n))
+        if not diffs:
+            continue
+        out.append(
+            {
+                "role": "assistant",
+                "ts": ts,
+                "side": True,
+                "meta": False,
+                "model": "",
+                "skill": "",
+                "agent": meta.get("description") or "서브에이전트",
+                "turn": tool_turns.get(meta.get("toolUseId"), last_turn),
+                "parts": diffs,
+            }
+        )
+    return out
+
+
+HUNK_CMD_RE = re.compile(r"\bhunk\s+session\b")
+HUNK_LIST_HEAD_RE = re.compile(r"^(user:\d+(?:-\d+)?)\s+(\S+)\s+\[user\]$", re.M)
+
+
+def _hunk_kind(cmd):
+    """hunk CLI 명령 분류. hunk 명령이 아니면 ''. (01 파싱 규칙)"""
+    if not HUNK_CMD_RE.search(cmd or ""):
+        return ""
+    for key, kind in (
+        ("comment apply", "apply"),
+        ("comment add", "add"),
+        ("comment list", "list"),
+        ("session review", "review"),
+        ("session reload", "reload"),
+    ):
+        if key in cmd:
+            return kind
+    return "other"
+
+
+def _parse_comment_list(stdout):
+    """comment list stdout(텍스트/JSON) -> user 코멘트 배열."""
+    out = []
+    if (stdout or "").lstrip().startswith("{"):
+        try:
+            comments = json.loads(stdout).get("comments") or []
+        except ValueError:
+            comments = []
+        for c in comments:
+            if not isinstance(c, dict) or c.get("source") != "user":
+                continue
+            out.append(
+                {"id": c.get("noteId") or "", "file": c.get("filePath") or "",
+                 "hunk": c.get("hunkIndex"), "range": c.get("newRange"),
+                 "body": c.get("body") or "", "created": c.get("createdAt") or ""}
+            )
+        return out
+    for m in HUNK_LIST_HEAD_RE.finditer(stdout or ""):
+        c = {"id": m.group(1), "file": m.group(2), "hunk": None,
+             "range": None, "body": "", "created": ""}
+        body_lines, in_body = [], False
+        for line in stdout[m.end():].splitlines()[1:]:
+            if not line.strip() or HUNK_LIST_HEAD_RE.match(line):
+                break
+            f = line.strip()
+            if f.startswith("hunk:"):
+                in_body = False
+                try:
+                    c["hunk"] = int(f[len("hunk:"):].strip())
+                except ValueError:
+                    pass
+            elif f.startswith("body:"):
+                in_body = True
+                body_lines.append(f[len("body:"):].strip())
+            elif f.startswith("author:"):
+                in_body = False
+            elif in_body:
+                body_lines.append(f)
+        c["body"] = "\n".join(body_lines).strip()
+        out.append(c)
+    return out
+
+
+HUNK_APPLY_JSON_RE = re.compile(r"\{\"comments\":\[.*\]\}", re.S)
+HUNK_APPLIED_RE = re.compile(
+    r"^\s*- (mcp:[\w-]+:\d+) on (.+?):(\d+) \((new|moved)\) hunk (\d+)$", re.M
+)
+
+
+def _parse_apply(cmd, stdout):
+    """comment apply 명령의 JSON + 결과 stdout -> 응답 배열."""
+    m = HUNK_APPLY_JSON_RE.search(cmd or "")
+    if not m:
+        return []
+    try:
+        entries = json.loads(m.group(0).replace("'\\''", "'")).get("comments") or []
+    except ValueError:
+        return []
+    applied = HUNK_APPLIED_RE.findall(stdout or "")
+    out = []
+    for k, c in enumerate(entries):
+        if not isinstance(c, dict):
+            continue
+        line, status = c.get("newLine"), ""
+        if k < len(applied) and applied[k][1] == c.get("filePath"):
+            line = line or int(applied[k][2])
+            status = applied[k][3]
+        out.append(
+            {"file": c.get("filePath") or "", "line": line, "status": status,
+             "summary": c.get("summary") or "", "rationale": c.get("rationale") or ""}
+        )
+    return out
+
+
+def _file_match(abs_path, rel_path):
+    """diff의 절대경로와 hunk 코멘트의 repo 상대경로를 잇는다."""
+    return abs_path == rel_path or abs_path.endswith("/" + rel_path)
+
+
+def _hunk_reviews(events):
+    """이벤트 순회로 리뷰 스레드 조립. 스레드 = (사이클, 파일). (01 조립 규칙)"""
+    threads = []
+    cycle = None  # 파일 -> 스레드 (열린 사이클)
+    seen = set()
+    pending_apply = []  # 아직 결과를 못 만난 apply 명령 (FIFO)
+    last_diff = {}  # 파일 -> [ev, part] 마지막 diff (원본 hunk 복원용)
+    for i, ev in enumerate(events):
+        for j, p in enumerate(ev["parts"]):
+            if p["type"] == "file_diff":
+                for rel, th in (cycle or {}).items():
+                    if _file_match(p["file"], rel):
+                        th["fixes"].append([i, j])
+                last_diff[p["file"]] = [i, j]
+            elif p.get("hunk") == "apply":
+                if p["type"] == "tool_use":
+                    pending_apply.append(
+                        (p.get("input") or {}).get("command") or ""
+                    )
+                elif p["type"] == "tool_result" and pending_apply:
+                    replies = _parse_apply(
+                        pending_apply.pop(0), p.get("text") or ""
+                    )
+                    for r in replies:
+                        th = cycle.get(r["file"]) if cycle else None
+                        if not th:
+                            # 리네임 등으로 파일 매칭 실패 → 응답 단독 스레드
+                            th = {"file": r["file"], "ev": i, "comments": [],
+                                  "fixes": [], "replies": [], "origin": None}
+                            threads.append(th)
+                        th["replies"].append(r)
+                    if replies:
+                        cycle = None
+            elif p.get("hunk") == "list" and p["type"] == "tool_result":
+                fresh = [
+                    c for c in _parse_comment_list(p.get("text") or "")
+                    if c["id"] not in seen
+                ]
+                if not fresh:
+                    continue
+                cycle = {}
+                for c in fresh:
+                    seen.add(c["id"])
+                    th = cycle.get(c["file"])
+                    if not th:
+                        origin = max(
+                            (loc for f, loc in last_diff.items()
+                             if _file_match(f, c["file"])),
+                            default=None,
+                        )
+                        th = {"file": c["file"], "ev": i, "comments": [],
+                              "fixes": [], "replies": [], "origin": origin}
+                        cycle[c["file"]] = th
+                        threads.append(th)
+                    th["comments"].append(
+                        {k: c[k] for k in ("id", "hunk", "range", "body", "created")}
+                    )
+    return threads
+
+
+def parse_session(path, redact=False):
+    """jsonl -> 뷰어가 그리는 이벤트 배열."""
+    events = []
+    tool_names = {}
+    tool_turns = {}  # tool_use id -> 턴 번호 (서브에이전트 diff를 부모 턴에 붙일 때)
+    tool_hunk = {}  # tool_use id -> hunk CLI 종류 (리뷰 스레드 조립용)
+    pending_ask = {}  # tool_use id -> (그 이벤트의 parts, tool_use 파트, questions)
+    skill_uses = {}  # Skill tool_use id -> 스킬 이름
+    meta = {"id": os.path.basename(path)[:-6], "cwd": "", "branch": "", "path": path}
+    counts = {"user": 0, "assistant": 0, "tool": 0, "sidechain": 0, "thinking": 0}
+    turn = 0
+
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                e = json.loads(line)
+            except ValueError:
+                continue
+
+            meta["cwd"] = meta["cwd"] or e.get("cwd") or ""
+            meta["branch"] = meta["branch"] or e.get("gitBranch") or ""
+            etype = e.get("type")
+            if etype not in ("user", "assistant"):
+                continue
+
+            side = bool(e.get("isSidechain"))
+            msg = e.get("message") or {}
+            content = msg.get("content")
+            if isinstance(content, str):
+                content = [{"type": "text", "text": content}]
+            if not isinstance(content, list):
+                continue
+
+            # 진짜 지시만 턴 경계다 (02 실측 + 04가 좁힌 정의)
+            if (
+                etype == "user"
+                and not side
+                and not e.get("isMeta")
+                and opens_turn(content)
+            ):
+                turn += 1
+
+            # Skill 툴이 주입한 스킬 안내문이면 이름 달린 접이식 파트로 만든다.
+            skill_name = (
+                skill_uses.get(e.get("sourceToolUseID")) if etype == "user" else None
+            )
+            parts = []
+            for p in content:
+                if not isinstance(p, dict):
+                    continue
+                t = p.get("type")
+                if t == "text":
+                    raw = p.get("text") or ""
+                    cmd = CMD_RE.search(raw)
+                    if cmd:
+                        a = CMD_ARGS_RE.search(raw)
+                        parts.append(
+                            {
+                                "type": "command",
+                                "name": " ".join(cmd.group(1).split()),
+                                "args": " ".join(a.group(1).split()) if a else "",
+                            }
+                        )
+                    out = STDOUT_RE.search(raw)
+                    if out and out.group(1).strip():
+                        parts.append(
+                            {"type": "tool_result", "name": "출력", "error": False,
+                             "text": clip(out.group(1).strip())}
+                        )
+                    body = strip_noise(raw).strip()
+                    name = skill_name
+                    if not name and e.get("isMeta") and body.startswith(SKILL_PREFIX):
+                        # 슬래시 커맨드로 트리거된 스킬: 경로 첫 줄에서 이름을 뽑는다.
+                        first = body.split("\n", 1)[0][len(SKILL_PREFIX):]
+                        name = os.path.basename(first.strip().rstrip("/")) or "skill"
+                    if body and name:
+                        parts.append(
+                            {"type": "skill", "name": name, "text": clip(body)}
+                        )
+                    elif body:
+                        parts.append({"type": "text", "text": clip(body)})
+                elif t == "thinking":
+                    think = (p.get("thinking") or "").strip()
+                    if think:
+                        counts["thinking"] += 1
+                        parts.append({"type": "thinking", "text": clip(think)})
+                elif t == "tool_use":
+                    tool_names[p.get("id")] = p.get("name")
+                    tool_turns[p.get("id")] = turn
+                    counts["tool"] += 1
+                    inp = p.get("input")
+                    if isinstance(inp, dict):
+                        inp = dict(
+                            (k, clip(v) if isinstance(v, str) else v)
+                            for k, v in inp.items()
+                        )
+                    part = {
+                        "type": "tool_use",
+                        "name": p.get("name") or "tool",
+                        "input": inp,
+                    }
+                    if p.get("name") == "Bash" and isinstance(inp, dict):
+                        hk = _hunk_kind(inp.get("command") or "")
+                        if hk:
+                            part["hunk"] = hk
+                            tool_hunk[p.get("id")] = hk
+                    parts.append(part)
+                    if p.get("name") == "Skill" and isinstance(inp, dict):
+                        skill_uses[p.get("id")] = inp.get("skill") or "skill"
+                    if p.get("name") == "AskUserQuestion":
+                        qs = (p.get("input") or {}).get("questions")
+                        if isinstance(qs, list):
+                            pending_ask[p.get("id")] = (parts, part, qs)
+                elif t == "tool_result":
+                    ask = pending_ask.pop(p.get("tool_use_id"), None)
+                    tur = e.get("toolUseResult")
+                    answers = tur.get("answers") if isinstance(tur, dict) else None
+                    if ask and isinstance(answers, dict):
+                        # 질문·답변 쌍은 툴 표시 대신 ask 파트 하나로 합친다.
+                        src_parts, src_part, qs = ask
+                        src_parts.remove(src_part)
+                        counts["tool"] -= 1
+                        parts.append(
+                            {
+                                "type": "ask",
+                                "items": [
+                                    {
+                                        "question": q.get("question") or "",
+                                        "header": q.get("header") or "",
+                                        "answer": answers.get(q.get("question"), ""),
+                                    }
+                                    for q in qs
+                                ],
+                            }
+                        )
+                        continue
+                    tname = tool_names.get(p.get("tool_use_id"), "")
+                    fd = file_diff_part(tname, tur, bool(p.get("is_error")))
+                    if fd:
+                        parts.append(fd)
+                        continue
+                    tr = {
+                        "type": "tool_result",
+                        "name": tname,
+                        "error": bool(p.get("is_error")),
+                        "text": clip(result_text(p.get("content"))),
+                    }
+                    hk = tool_hunk.get(p.get("tool_use_id"))
+                    if hk:
+                        tr["hunk"] = hk
+                    parts.append(tr)
+                elif t == "image":
+                    parts.append({"type": "text", "text": "(이미지)"})
+
+            if not parts:
+                continue
+
+            if side:
+                counts["sidechain"] += 1
+            elif etype == "user":
+                if any(p["type"] == "text" for p in parts):
+                    counts["user"] += 1
+            else:
+                counts["assistant"] += 1
+
+            events.append(
+                {
+                    "role": etype,
+                    "ts": e.get("timestamp") or "",
+                    "side": side,
+                    "meta": bool(e.get("isMeta")),
+                    "model": (msg.get("model") or "") if etype == "assistant" else "",
+                    "skill": e.get("attributionSkill") or "",
+                    "turn": turn,
+                    "parts": parts,
+                }
+            )
+
+    for ev in _subagent_events(path, tool_turns, turn):
+        counts["sidechain"] += 1
+        # 부모 턴의 마지막 이벤트 뒤에 끼워 턴 묶음을 연속으로 유지한다.
+        i = max(
+            (j for j, x in enumerate(events) if x["turn"] == ev["turn"]),
+            default=len(events) - 1,
+        )
+        events.insert(i + 1, ev)
+
+    data = {"meta": meta, "counts": counts, "events": events,
+            "reviews": _hunk_reviews(events)}
+    if redact:
+        data = json.loads(redact_text(json.dumps(data, ensure_ascii=False)))
+    return data
+
+
+def redact_text(s):
+    s = s.replace(HOME.replace("/", "\\/"), "~")
+    s = s.replace(HOME, "~")
+    user = os.path.basename(HOME)
+    s = re.sub(r"/Users/%s\b" % re.escape(user), "~", s)
+    return s
+
+
+# --------------------------------------------------------------------- view
+
+
+VIEWER_CSS = r"""
+/* 가독성 재설계 — 02 카드 시각 언어 · 03 활동 압축 · 04 항해 장치 · 05 md 커버리지 */
+:root{color-scheme:light dark;
+/* height:auto 로도 전환이 걸린다 — 펼침 높이를 JS 로 재지 않기 위한 전제 */
+interpolate-size:allow-keywords;
+--bg:#f6f8fa;--fg:#1f2328;--dim:#59636e;--line:#d1d9e0;--card:#fff;--head:#f6f8fa;
+--uhead:#ddedff;--ubd:#9fc7ee;--code:#f0f2f5;--acc:#0969da;--warn:#9a6700;
+--err:#d1242f;--ok:#1a7f37;--hh:44px;
+/* 기본 CSS 이징은 약하다 — UI 의도가 드러나는 강한 커브만 쓴다.
+   out: 등장·퇴장(즉시 반응) / in-out: 화면 위 이동 */
+--ease-out:cubic-bezier(.23,1,.32,1);--ease-in-out:cubic-bezier(.77,0,.175,1)}
+@media (prefers-color-scheme:dark){:root{
+--bg:#0d1117;--fg:#e6edf3;--dim:#8d96a0;--line:#30363d;--card:#161b22;--head:#1c2129;
+--uhead:#132a45;--ubd:#2c4f79;--code:#20252c;--acc:#5c9eed;--warn:#d29922;
+--err:#f47067;--ok:#57ab5a}}
+*{box-sizing:border-box}
+/* 스크롤바 자리를 늘 비워둔다 — 목록을 펼쳐 스크롤바가 생길 때 본문이 밀리지 않게.
+   scrollbar-gutter:stable은 overflow:visible인 루트에서 자리를 잡지 않아 실측상 무효였다. */
+html{background:var(--bg);overflow-y:scroll}
+body{margin:0;background:var(--bg);color:var(--fg);
+font:15px/1.6 -apple-system,BlinkMacSystemFont,"Pretendard","Apple SD Gothic Neo",Segoe UI,sans-serif}
+a{color:var(--acc)}
+.wrap{max-width:860px;margin:0 auto;padding:24px 20px 160px}
+header{position:sticky;top:0;z-index:9;background:var(--bg);border-bottom:1px solid var(--line);
+padding:11px 20px;display:flex;gap:12px;align-items:baseline;flex-wrap:wrap}
+header h1{font-size:14px;margin:0;font-weight:600}
+.sub{color:var(--dim);font-size:12px}
+.filters{display:flex;gap:12px;flex-wrap:wrap;margin-left:auto;font-size:12px;color:var(--dim)}
+.filters label{display:flex;gap:4px;align-items:center;cursor:pointer;user-select:none}
+input[type=search]{background:var(--card);border:1px solid var(--line);color:var(--fg);
+border-radius:7px;padding:5px 10px;font-size:13px;min-width:210px}
+/* 1px 테두리 색 변화만으로는 포커스 위치를 못 찾는다 — 링을 남긴다 */
+input[type=search]:focus{outline:none;border-color:var(--acc);
+box-shadow:0 0 0 3px color-mix(in srgb,var(--acc) 22%,transparent)}
+.empty{color:var(--dim);padding:40px 0;text-align:center}
+.hidden{display:none!important}
+/* 공통 포커스 링 — all:unset 이나 커스텀 컨트롤이 링을 지우지 않게 */
+.b-all button:focus-visible,.rv-tabs button:focus-visible,.rv-mk:focus-visible,
+.tick:focus-visible{outline:2px solid var(--acc);outline-offset:2px;border-radius:6px}
+.list a:focus-visible{outline:2px solid var(--acc);outline-offset:-2px;border-radius:8px}
+
+/* ── 목록 화면 — 같은 카드 문법의 부차 적용 ────────────────────── */
+.list{list-style:none;padding:0;margin:0;display:flex;flex-direction:column;gap:6px}
+.list li{border:1px solid var(--line);border-radius:8px;background:var(--card);
+transition:border-color 140ms var(--ease-out),transform 140ms var(--ease-out)}
+@media (hover:hover) and (pointer:fine){.list li:hover{border-color:var(--ubd)}}
+/* 넓은 행이라 .97은 과하다 — 눌린 걸 알아챌 만큼만 */
+.list li:active{transform:scale(.99)}
+.list a{display:block;padding:11px 14px;text-decoration:none;color:inherit}
+.list .t{font-weight:600;font-size:14px;word-break:keep-all;overflow-wrap:anywhere}
+.list .m{color:var(--dim);font-size:11.5px;margin-top:4px;display:flex;gap:10px;
+flex-wrap:wrap;font-variant-numeric:tabular-nums}
+/* 여닫아도 머리줄은 제자리 — 여백은 헤더 바깥이 아니라 펼쳐지는 목록 안쪽에서
+   만든다. 열림에 따라 margin 이 달라지면 방금 누른 줄이 손끝에서 달아난다. */
+details.grp{border:none;background:none;margin:4px 0 0;border-radius:0}
+details.grp[open]{background:none;border:none;margin:4px 0 0}
+details.grp:first-of-type{margin-top:0}
+details.grp>summary{padding:5px 2px;font-size:12px;font-weight:650;color:var(--dim);
+letter-spacing:.01em;transition:color 120ms var(--ease-out)}
+details.grp>summary:hover{background:none;color:var(--fg)}
+details.grp>summary .cnt{color:var(--dim);font-weight:400;font-variant-numeric:tabular-nums}
+/* 글리프를 바꾸면 폭이 튄다 — 같은 삼각형을 돌린다 */
+details.grp>summary::before{content:"▸";display:inline-block;
+transition:transform 220ms var(--ease-out)}
+details.grp[open]>summary::before{content:"▸";transform:rotate(90deg)}
+details.grp>.list{padding:5px 0 12px}
+/* 펼침은 머리줄 아래에서 자라 나온다 (::details-content 미지원이면 즉시 열림) */
+details.grp::details-content{block-size:0;overflow:clip;
+transition:block-size 220ms var(--ease-out),content-visibility 220ms allow-discrete}
+details.grp[open]::details-content{block-size:auto}
+
+/* ── 타임라인 레일 ─────────────────────────────────────────────── */
+.turn{position:relative;margin:0 0 28px;scroll-margin-top:calc(var(--hh) + 12px)}
+.turn::before{content:"";position:absolute;left:15px;top:8px;bottom:-20px;
+width:2px;background:var(--line)}
+.turn:last-of-type::before{display:none}
+.ev{position:relative;margin:14px 0 14px 40px}
+
+/* ── 발화 = 카드 + 헤더 스트립 ─────────────────────────────────── */
+/* 카드는 "발화"에만 — 직계 자식으로 판정해야 사고 과정(details 안의 .md)이나
+   명령·툴 결과가 지시 카드처럼 보이지 않는다.
+   overflow는 visible이어야 레일 점(.ev::before)이 잘리지 않고 .who가 sticky가 된다 (03·04) */
+.ev.user:has(>.bubble),.ev.assistant:has(>.md){background:var(--card);
+border:1px solid var(--line);border-radius:8px;overflow:visible}
+.ev.user:has(>.bubble)::before,.ev.assistant:has(>.md)::before{content:"";position:absolute;
+left:-28.5px;top:12px;width:9px;height:9px;border-radius:50%;
+background:var(--dim);outline:4px solid var(--bg)}
+.ev.user:has(>.bubble)::before{background:var(--acc)}
+.who{font-size:11px;font-weight:500;color:var(--dim);margin:0;padding:0 0 4px;
+display:flex;gap:8px;align-items:center;text-transform:none;letter-spacing:0}
+.ev.user:has(>.bubble)>.who,.ev.assistant:has(>.md)>.who{font-size:12px;font-weight:600;
+color:var(--fg);padding:8px 14px;background:var(--head);
+border-bottom:1px solid var(--line);border-radius:7px 7px 0 0}
+.ev.user:has(>.bubble){border-color:var(--ubd)}
+.ev.user:has(>.bubble)>.who{background:var(--uhead);border-bottom-color:var(--ubd);
+color:var(--acc)}
+.ev.user:has(>.bubble)>.who::before,.ev.assistant:has(>.md)>.who::before{content:"";
+width:9px;height:9px;border-radius:50%;background:var(--acc);flex:none}
+.ev.assistant:has(>.md)>.who::before{background:var(--dim)}
+.badge{border:1px solid var(--line);border-radius:999px;padding:0 7px;font-size:11px;
+font-weight:400;color:var(--dim)}
+.user .bubble{background:none;border:none;border-radius:0;padding:12px 16px}
+.user .bubble>.cmd{padding:2px 0}  /* 카드 패딩과 이중으로 들여쓰지 않는다 */
+/* 슬래시 커맨드의 인자는 "내가 한 말"이다 — 활동줄의 인자와 같은 서체를 쓰면
+   페이지에서 가장 중요한 글이 가장 작고 가장 안 읽히는 서체가 된다. 본문으로 되돌린다. */
+.user .bubble>.cmd{font-size:15px;line-height:1.6;color:var(--fg)}
+.user .bubble>.cmd .arg{font-family:inherit;font-size:inherit;color:var(--fg);
+white-space:pre-wrap;word-break:keep-all;overflow-wrap:anywhere}
+/* 카드도 활동줄도 아닌 이벤트(스킬 안내 등)의 역할 라벨은 잔해다 — 내용만 남긴다 */
+.ev:not(.side):not(:has(>.bubble)):not(:has(>.md)):not(:has(>.ask))>.who{display:none}
+.ev.assistant:has(>.md)>.md,.ev.assistant:has(>.md)>details,
+.ev.assistant:has(>.md)>.cmd,.ev.assistant:has(>.md)>.fd{margin-left:16px;margin-right:16px}
+.ev.assistant:has(>.md)>.md{margin-top:11px;margin-bottom:13px}
+.ev.side{margin-left:64px}
+.ev.side .who{font-size:11px}
+
+/* ── 본문 타이포 ───────────────────────────────────────────────── */
+.md{overflow-wrap:anywhere;word-break:keep-all}
+.md p{margin:.55em 0}
+.md ul,.md ol{margin:.4em 0;padding-left:1.3em}
+.md code{background:var(--code);padding:1px 5px;border-radius:4px;font-size:.88em;
+font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+.md pre{background:var(--code);padding:11px 13px;border-radius:8px;overflow-x:auto;margin:.6em 0}
+.md pre code{background:none;padding:0;font-size:13.5px;line-height:1.55}
+/* 헤딩 레벨 복원 — 카드 안이라 위계는 굵기·여백이 지고 크기는 절제한다 (05) */
+.md h1,.md h2,.md h3,.md h4,.md h5,.md h6{margin:1.5em 0 .5em;line-height:1.4;word-break:keep-all}
+.md h1{font-size:1.18em;font-weight:700;letter-spacing:-.011em}
+.md h2{font-size:1.06em;font-weight:700;letter-spacing:-.008em}
+.md h3{font-size:1em;font-weight:680}
+.md h4,.md h5,.md h6{font-size:.94em;font-weight:650;color:var(--dim)}
+.md>:first-child{margin-top:0}
+.md h1+*,.md h2+*,.md h3+*{margin-top:0}
+/* 표 — 본문 폭을 넘으면 표만 가로로 흐르고 본문은 밀리지 않는다 (05) */
+.md .tw{overflow-x:auto;margin:.85em 0;border:1px solid var(--line);border-radius:8px;
+-webkit-overflow-scrolling:touch}
+.md table{border-collapse:collapse;font-size:.92em;line-height:1.5;width:100%;
+font-variant-numeric:tabular-nums}
+.md th,.md td{padding:7px 12px;text-align:left;border-bottom:1px solid var(--line);
+vertical-align:top;word-break:keep-all}
+/* position:sticky 였으나 .tw 가 overflow-x:auto — 세로 스크롤이 없어 붙을 곳이 없었다 */
+.md thead th{background:var(--head);font-weight:650;white-space:nowrap}
+.md tbody tr:last-child td{border-bottom:0}
+.md td code{white-space:nowrap}
+/* 인용문 — 좌측 레일 하나로만 (카드 위에 또 카드를 얹지 않는다) */
+.md blockquote{margin:.8em 0;padding:.1em 0 .1em 14px;border-left:2px solid var(--line);
+color:var(--dim)}
+.md blockquote>:first-child{margin-top:0}
+.md blockquote>:last-child{margin-bottom:0}
+.md hr{border:0;border-top:1px solid var(--line);margin:1.6em 0}
+.md ul ul,.md ul ol,.md ol ul,.md ol ol{margin:.25em 0 .35em}
+.md ul ul{list-style:circle}
+.md ul ul ul{list-style:square}
+.md li{margin:.18em 0}
+.md li>p{margin:.3em 0}
+.md li.task{list-style:none;margin-left:-1.15em}
+.md li.task input{margin:0 7px 0 0;vertical-align:-1px;accent-color:var(--acc)}
+/* 코드블록 — 하이라이팅 기각(05). 가로 스크롤 + 타이포만 */
+.md pre.cb{overscroll-behavior-x:contain;tab-size:2}
+.md pre.cb code{display:block;white-space:pre;min-width:min-content}
+.md del{opacity:.55}
+.md a{color:var(--acc);text-underline-offset:2px;
+text-decoration-color:color-mix(in srgb,var(--acc) 35%,transparent)}
+
+/* ── 활동: 카드 밖 타임라인 한 줄 ──────────────────────────────── */
+details{border:none;margin:1px 0;background:none;border-radius:6px}
+details>summary{cursor:pointer;padding:2px 8px;font-size:12px;color:var(--dim);
+list-style:none;display:flex;gap:7px;align-items:center;border-radius:6px;
+transition:background 120ms var(--ease-out)}
+@media (hover:hover) and (pointer:fine){
+details>summary:hover{background:color-mix(in srgb,var(--fg) 5%,transparent)}}
+details>summary::-webkit-details-marker{display:none}
+details>summary::before{content:"▸";font-size:9px;opacity:.7}
+details[open]>summary::before{content:"▾"}
+details[open]{background:var(--card);border:1px solid var(--line)}
+/* 열리면 요약줄은 상자의 머리다 — 아래 모서리를 둥글게 두면 본문과 어긋나 보인다 */
+details[open]>summary{border-radius:6px 6px 0 0}
+details .body{padding:2px 10px 10px}
+.tool summary strong{color:var(--dim);font-weight:600}
+/* 흐리게는 색으로 — opacity:.8 은 --dim 을 3.7:1 로 떨어뜨려 11.5px 에서 AA 실패였다 */
+.tool .arg{color:var(--dim);font-family:ui-monospace,Menlo,monospace;font-size:11.5px;
+white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:560px}
+.think summary{font-style:italic}
+.err summary strong{color:var(--err)}
+.cmd{font-size:12.5px;color:var(--dim);padding:2px 8px}
+.cmd code{background:var(--code);padding:1px 6px;border-radius:4px;
+font-family:ui-monospace,Menlo,monospace;color:var(--acc)}
+.cmd .arg{font-family:ui-monospace,Menlo,monospace;font-size:11.5px}
+pre.raw{background:var(--code);padding:9px 11px;border-radius:6px;overflow-x:auto;
+font-size:12px;line-height:1.5;margin:0;white-space:pre-wrap;overflow-wrap:anywhere;
+font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+.ask{border:1px solid var(--line);border-left:3px solid var(--acc);background:var(--card);
+border-radius:8px;padding:11px 14px;margin:6px 0}
+.ask-q{font-weight:600;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.ask-a{color:var(--acc);font-weight:600;margin:4px 0 12px}
+.ask-a::before{content:"→ "}
+.ask-a:last-child{margin-bottom:0}
+
+/* ── 03 활동 버스트 압축 ───────────────────────────────────────── */
+.burst{position:relative;margin:8px 0 8px 40px}
+.burst::before{content:"";position:absolute;left:-28.5px;top:9px;width:9px;height:9px;
+border-radius:50%;background:var(--bg);border:2px solid var(--line);
+outline:4px solid var(--bg);box-sizing:border-box}
+.burst.has-err::before{border-color:var(--err)}
+.burst-h{display:flex;gap:9px;align-items:center;flex-wrap:wrap;cursor:pointer;
+user-select:none;font-size:12px;line-height:1.45;color:var(--dim);
+padding:4px 11px;border-radius:7px;border:1px solid transparent;
+font-variant-numeric:tabular-nums;
+transition:background 140ms var(--ease-out),border-color 140ms var(--ease-out),
+transform 140ms var(--ease-out)}
+@media (hover:hover) and (pointer:fine){
+.burst-h:hover{background:color-mix(in srgb,var(--fg) 5%,transparent);border-color:var(--line)}}
+.burst-h:active{transform:scale(.99)}
+.burst-h:focus-visible{outline:2px solid var(--acc);outline-offset:1px}
+.burst-h::before{content:"▸";font-size:9px;opacity:.7;flex:none}
+.burst.open>.burst-h::before{content:"▾"}
+/* 펼친 헤더의 보더는 장식이 아니라 본문과 한 상자를 이루는 구조다 — 본문 좌우 보더는
+   첫 프레임부터 solid 인데 헤더만 140ms 페이드하면 두 조각이 어긋나 보인다.
+   열림 상태에서는 transition 목록에서 border-color 를 빼 같은 순간에 나타나게 한다. */
+.burst.open>.burst-h{background:color-mix(in srgb,var(--fg) 4%,transparent);
+border-color:var(--line);border-radius:7px 7px 0 0;
+transition:background 140ms var(--ease-out),transform 140ms var(--ease-out)}
+.b-n{font-weight:650;color:var(--fg)}
+.b-sep{opacity:.4}
+.b-err{color:var(--err);font-weight:600}
+/* opacity:.65 였으나 --dim 대비를 2.8:1 로 떨어뜨렸다 (11px, AA 실패) */
+.b-t{margin-left:auto;font-size:11px;white-space:nowrap}
+/* 접힘은 hidden=until-found가 맡는다 — 브라우저 Ctrl+F가 안까지 찾는다 (04).
+   테두리·패딩은 안쪽 래퍼로 내려야 접힌 상태에서 빈 상자가 남지 않는다. */
+.burst-body{overflow:hidden}   /* 펼침 높이 애니메이션의 클리핑 상자 */
+.burst-in{padding:4px 0 8px 10px;border:1px solid var(--line);border-top:none;
+border-radius:0 0 7px 7px}
+.burst-in>.ev{margin:1px 0}
+.burst-in .ev>.who{display:none}
+.burst-in .ev::before{display:none}
+.b-all{display:flex;gap:10px;padding:2px 10px 6px;font-size:11px;color:var(--dim)}
+.b-all button{all:unset;cursor:pointer;border-bottom:1px dotted var(--line);padding-bottom:1px;
+transition:color 120ms var(--ease-out),border-color 120ms var(--ease-out),
+transform 120ms var(--ease-out)}
+@media (hover:hover) and (pointer:fine){
+.b-all button:hover{color:var(--fg);border-color:var(--dim)}}
+.b-all button:active{transform:scale(.97)}
+
+/* ── 04 항해 장치: sticky 지시 헤더 · 진행바 · 턴 눈금 ──────────── */
+/* sticky의 범위는 부모 상자다 — 지시 헤더가 턴 전체에서 고정되려면 카드 밖(턴의
+   직계 자식)으로 승격돼야 한다. 승격은 setupNav의 렌더 후처리가 한다. */
+.turn>.who.turn-head{position:sticky;top:var(--hh);z-index:3;margin:14px 0 0 40px;
+font-size:12px;font-weight:600;color:var(--acc);padding:8px 14px;background:var(--uhead);
+border:1px solid var(--ubd);border-radius:8px 8px 0 0;flex-wrap:nowrap}
+.turn>.who.turn-head::before{content:"";width:9px;height:9px;border-radius:50%;
+background:var(--acc);flex:none}
+/* 헤더가 카드 밖으로 승격되면 카드는 "위가 열린 상자"가 돼야 한다. 그런데
+   .ev.user:has(>.bubble) 의 :has() 가 특이도를 (0,3,0) 으로 끌어올려 border-radius:8px 와
+   border:1px 가 그대로 이겼고, 결과적으로 상자 두 개가 겹쳐 보더가 깨져 있었다. */
+.ev.user.turn-open:has(>.bubble),.ev.assistant.turn-open:has(>.md),
+.ev.turn-open{margin-top:0;border-top:none;border-radius:0 0 8px 8px}
+.ev.user.turn-open::before{top:-21px}
+.who .ts,.who .tnav{font-weight:400;color:var(--dim)}
+.who .ts::before,.who .tnav::before{content:"·";opacity:.45;margin-right:6px}
+.who .ts{font-variant-numeric:tabular-nums}
+.who .tnav b{font-weight:650;font-variant-numeric:tabular-nums;color:var(--acc)}
+/* 시각·지시요약 교체 — display 스위치는 애니메이션이 불가능하고 행 너비까지 튄다.
+   같은 grid cell 에 겹쳐두면 너비가 넓은 쪽으로 고정되고 opacity 만 오간다. */
+.who .swap{display:grid;min-width:0;flex:1 1 auto}
+.who .swap>*{grid-area:1/1;min-width:0;overflow:hidden;white-space:nowrap;
+text-overflow:ellipsis;transition:opacity 90ms ease-out,filter 90ms ease-out}
+/* 겹친 크로스페이드는 두 글자가 반투명하게 함께 읽히는 프레임을 만든다 —
+   나가는 쪽을 먼저 보내고(0ms) 들어오는 쪽을 늦게(70ms) 띄우며 blur 로 틈을 메운다 */
+.who .ts{transition-delay:70ms}
+.who .tnav{opacity:0;filter:blur(2px)}
+.who.stuck .ts{opacity:0;filter:blur(2px);transition-delay:0ms}
+.who.stuck .tnav{opacity:1;filter:none;transition-delay:70ms}
+.who.turn-head{transition:box-shadow 140ms ease}
+/* -12px 스프레드는 실질적으로 안 보였다 — 본문이 헤더 밑을 그냥 통과해 보인다 */
+.who.turn-head.stuck{box-shadow:0 6px 12px -8px rgba(0,0,0,.35)}
+#prog{position:absolute;left:0;right:0;bottom:-1px;height:2px;pointer-events:none}
+#progfill{height:2px;width:0;background:var(--acc);opacity:.9}
+/* 이 페이지의 유일한 목차다 — 11×12px 히트 영역에 2×5px/50% 눈금은 실측상 겨냥이 안 됐다 */
+.tick{all:unset;position:absolute;top:-7px;width:18px;height:16px;margin-left:-9px;
+cursor:pointer;pointer-events:auto;display:flex;align-items:flex-end;justify-content:center}
+.tick::before{content:"";width:2px;height:6px;border-radius:1px;background:var(--dim);
+opacity:.7;transition:height 120ms var(--ease-out),opacity 120ms,background 120ms}
+.tick:hover::before,.tick:focus-visible::before{height:11px;opacity:1;background:var(--acc)}
+/* 눈금은 헤더 아래끝에 있다 — 툴팁은 아래로 자라야 origin 이 맞고, 세션 제목도 가리지 않는다 */
+#progtip{position:absolute;top:10px;max-width:min(62vw,440px);background:var(--fg);
+color:var(--bg);font-size:11.5px;line-height:1.45;padding:4px 9px;border-radius:6px;
+white-space:nowrap;overflow:hidden;text-overflow:ellipsis;pointer-events:none;opacity:0;
+transform:translateY(-4px);transition:opacity 120ms,transform 120ms var(--ease-out);
+box-shadow:0 4px 12px -6px rgba(0,0,0,.4)}
+#progtip.on{opacity:1;transform:none}
+
+/* ── diff 카드 ─────────────────────────────────────────────────── */
+.fd{border:1px solid var(--line);border-radius:8px;margin:6px 0;background:var(--card);overflow:hidden}
+/* flex-wrap:wrap + 절대경로라 카드 한 장이 3줄로 깨졌다 — 한 줄 고정, 파일명 우선 */
+.fd>summary{display:flex;gap:7px;align-items:center;flex-wrap:nowrap;
+padding:6px 11px;font-size:12px;color:var(--dim);cursor:pointer}
+.fd>summary:hover{background:none}
+.fh-tool{border:1px solid var(--line);border-radius:4px;padding:0 5px;font-size:11px;
+text-transform:uppercase;letter-spacing:.03em;flex:none}
+.fh-path{display:flex;align-items:baseline;min-width:0;flex:1 1 auto;overflow:hidden;
+white-space:nowrap;font-family:ui-monospace,Menlo,monospace;font-size:11.5px}
+.fh-path .dir{min-width:0;overflow:hidden;text-overflow:ellipsis;color:var(--dim)}
+.fh-path b{flex:none;color:var(--fg);font-weight:600}
+.fd>summary>.badge{flex:none}
+.fh-stat{flex:none;font-family:ui-monospace,Menlo,monospace;font-size:11.5px;white-space:nowrap}
+.plus{color:var(--ok)}.minus{color:var(--err)}
+table.dt{border-collapse:collapse;width:100%;font:12px/1.5 ui-monospace,Menlo,monospace;
+border-top:1px solid var(--line);background:var(--card)}
+.dt td{padding:0 8px;white-space:pre-wrap;overflow-wrap:anywhere;vertical-align:top}
+.dt .ln{color:var(--dim);text-align:right;user-select:none;width:1%;min-width:30px;
+font-size:10.5px;padding:1px 6px;border-right:1px solid var(--line)}
+.dt tr.add{background:color-mix(in srgb,var(--ok) 13%,transparent)}
+.dt tr.del{background:color-mix(in srgb,var(--err) 11%,transparent)}
+.dt tr.hh td{color:var(--dim);background:var(--code);padding:2px 8px;font-size:11px}
+
+/* ── hunk-review 리뷰 스레드 카드·리뷰 탭 ──────────────────────── */
+.rv{border:1px solid var(--ubd);border-left:3px solid var(--acc);border-radius:8px;
+margin:10px 0;background:var(--card);overflow:hidden}
+.rv-h{display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:7px 11px;
+font-size:12px;color:var(--dim);border-bottom:1px solid var(--line)}
+.rv-h .fh-path{font-size:11.5px}
+.rv-anchor{font-family:ui-monospace,Menlo,monospace;font-size:11px}
+.rv-state{margin-left:auto;font-size:10.5px;border:1px solid var(--line);
+border-radius:999px;padding:0 7px}
+.rv-state.done{color:var(--ok);border-color:var(--ok)}
+.rv-state.open{color:var(--warn);border-color:var(--warn)}
+.rv-body{padding:4px 11px 9px}
+.rv-c{background:var(--uhead);border:1px solid var(--ubd);border-radius:8px;
+padding:8px 11px;margin:7px 0}
+.rv-c .who-s{font-size:10.5px;text-transform:uppercase;letter-spacing:.04em;
+color:var(--dim);margin-bottom:2px}
+.rv-r{border:1px solid var(--line);border-radius:8px;padding:8px 11px;margin:7px 0;
+background:var(--bg)}
+.rv-r .sum{font-weight:600}
+.rv-r .rat{color:var(--dim);font-size:12.5px;margin-top:3px}
+.rv .fd{margin:7px 0}
+.rv-label{font-size:10.5px;color:var(--dim);margin:7px 0 -3px}
+.rv.rv-agent{border-color:var(--line);border-left-color:var(--dim)}
+.rv-mk{border:1px dashed var(--ubd);border-radius:8px;margin:10px 0 10px 40px;padding:7px 11px;
+font-size:12.5px;color:var(--acc);cursor:pointer;background:var(--card);
+transition:background 140ms var(--ease-out),transform 140ms var(--ease-out)}
+@media (hover:hover) and (pointer:fine){.rv-mk:hover{background:var(--uhead)}}
+.rv-mk:active{transform:scale(.99)}
+.rv-mk b{font-family:ui-monospace,Menlo,monospace;font-size:11.5px}
+/* 리뷰 탭에서 마커로 점프해 온 스레드를 한 번 알려준다 — 처음 한 번만 보는 연출 */
+@keyframes rv-flash{from{background:var(--uhead);border-color:var(--acc)}}
+.rv.flash{animation:rv-flash 900ms var(--ease-out)}
+.rv-tabs{position:relative;display:flex;gap:6px;margin:0 0 14px;border-bottom:1px solid var(--line)}
+.rv-tabs button{all:unset;cursor:pointer;padding:8px 14px;font-size:13px;
+color:var(--dim);transition:color 140ms ease,transform 140ms var(--ease-out)}
+.rv-tabs button:active{transform:scale(.97)}
+.rv-tabs button.on{color:var(--fg);font-weight:600}
+/* 밑줄이 옮겨가야 두 탭이 하나의 컨트롤로 읽힌다 — 화면 위 이동이므로 ease-in-out */
+.rv-tabs .ind{position:absolute;bottom:-1px;left:0;height:2px;width:0;background:var(--acc);
+transform-origin:left center;transition:transform 200ms var(--ease-in-out),
+width 200ms var(--ease-in-out)}
+.rvp-f{font-size:12.5px;font-weight:600;margin:18px 0 4px;
+font-family:ui-monospace,Menlo,monospace;overflow-wrap:anywhere}
+.rvp-f:first-child{margin-top:0}
+.rv-state{font-size:11px}
+#app{transition:opacity 160ms var(--ease-out)}
+
+/* ── 줄임 모드 ─────────────────────────────────────────────────────
+   0 이 아니라 "덜, 부드럽게" — 위치·크기 이동만 걷어내고 이해를 돕는
+   opacity·색 전환은 남긴다. 높이 애니메이션·스무스 스크롤은 JS 쪽에서도 끈다. */
+@media (prefers-reduced-motion:reduce){
+  .list li,.burst-h,.rv-mk,.b-all button{transition-property:background,border-color,color}
+  .list li:active,.burst-h:active,.rv-mk:active,.b-all button:active,
+  .rv-tabs button:active{transform:none}
+  .rv-tabs .ind{transition:none}
+  #progtip{transform:none}
+  .rv.flash{animation-duration:1ms}
+  .tick::before{transition-property:opacity,background}
+  details.grp::details-content,details.grp>summary::before{transition:none}
+}
+/* 검색은 한 글자마다 그룹을 여닫는다 — 그때만 높이 전환을 끈다 */
+body.searching details.grp::details-content,
+body.searching details.grp>summary::before{transition:none}
+"""
+
+VIEWER_JS = r"""
+const esc = s => String(s == null ? '' : s)
+  .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+
+/* 줄임 모드는 CSS 로 못 막는 것(높이 애니메이션·스무스 스크롤)까지 끈다 */
+const REDUCED = matchMedia('(prefers-reduced-motion: reduce)');
+const SCROLL_BEHAVIOR = () => REDUCED.matches ? 'auto' : 'smooth';
+
+/* 마크다운 렌더러 — GFM 수준까지 커버, 코드 하이라이팅은 기각 (05 결정).
+   처리 순서가 곧 안전장치다:
+     1) esc  2) 펜스 코드블록 추출  3) 인라인 코드 추출  → 이후 어떤 인라인 규칙도
+     코드 내부를 건드리지 못한다(인라인코드 안의 **가 볼드로 먹히던 버그도 함께 사라진다).
+   자리표시자는 raw NUL이 아니라 \u0000 이스케이프 — HTML 파서가 script 안의 raw NUL을
+   U+FFFD로 바꾼다. */
+
+function mdLink(href, text){
+  return '<a href="' + href + '" target="_blank" rel="noopener">' + text + '</a>';
+}
+
+function mdInline(t){
+  return t
+    .replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>')
+    // 닫는 *는 공백 뒤에 올 수 없다(CommonMark) — `*.ts, *.js` 같은 glob 오탐 차단
+    .replace(/(^|[^*\w])\*([^*\s](?:[^*\n]*[^*\s])?)\*(?!\*)/g, '$1<em>$2</em>')
+    .replace(/~~([^~\n]+)~~/g, '<del>$1</del>')
+    .replace(/\[([^\]\n]*)\]\((https?:[^)\s]+)\)/g,
+      (m0, txt, url) => mdLink(url, txt || url))
+    // 맨 URL 자동 링크 — 위에서 만든 <a href="…">보다 뒤에 오지만
+    // 선행 문자를 줄머리·공백·( 로 못박아 href 안을 다시 잡지 않는다.
+    .replace(/(^|[\s(])(https?:\/\/[^\s<>"'`)\]]+)/g, (m0, pre, url) => {
+      const tail = (url.match(/[.,;:!?]+$/) || [''])[0];
+      const u = url.slice(0, url.length - tail.length);
+      return pre + mdLink(u, u) + tail;
+    });
+}
+
+function mdCells(s){
+  let t = s.trim();
+  if (t.startsWith('|')) t = t.slice(1);
+  if (t.endsWith('|')) t = t.slice(0, -1);
+  return t.split('|').map(c => c.trim());
+}
+
+function mdRow(cells, align, tag){
+  return '<tr>' + cells.map((c, k) =>
+    '<' + tag + (align[k] ? ' style="text-align:' + align[k] + '"' : '') + '>'
+    + mdInline(c) + '</' + tag + '>').join('') + '</tr>';
+}
+
+function mdBlocks(lines){
+  const out = [], stack = [];
+  let para = [], quote = null;
+  const flushPara = () => {
+    // GFM 줄바꿈: 빈 줄만 문단을 나누고, 문단 안 줄바꿈은 <br>로 보존
+    if (para.length) { out.push('<p>' + para.map(mdInline).join('<br>') + '</p>'); para = []; }
+  };
+  const closeLists = () => { while (stack.length) out.push('</li></' + stack.pop().tag + '>'); };
+  const flushQuote = () => {
+    if (quote) { out.push('<blockquote>' + mdBlocks(quote) + '</blockquote>'); quote = null; }
+  };
+  const flushAll = () => { flushPara(); closeLists(); flushQuote(); };
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i].replace(/\s+$/, '');
+
+    // esc()가 이미 돌았으므로 인용 마커는 '>'가 아니라 '&gt;'다
+    const bq = line.match(/^ {0,3}&gt;\s?(.*)$/);
+    if (bq) { flushPara(); closeLists(); (quote = quote || []).push(bq[1]); continue; }
+    if (quote) flushQuote();
+
+    if (!line.trim()) { flushPara(); closeLists(); continue; }
+
+    if (/^\u0000B\d+\u0000$/.test(line.trim())) { flushAll(); out.push(line.trim()); continue; }
+
+    // 수평선 — 파이프가 없어야 하므로 표 구분선과 겹치지 않는다
+    if (/^ {0,3}(?:-{3,}|\*{3,}|_{3,})$/.test(line.trim())) { flushAll(); out.push('<hr>'); continue; }
+
+    const h = line.match(/^ {0,3}(#{1,6})\s+(.*?)\s*#*$/);
+    if (h) {
+      flushAll();
+      const n = h[1].length;
+      out.push('<h' + n + '>' + mdInline(h[2]) + '</h' + n + '>');
+      continue;
+    }
+
+    // GFM 표 — 다음 줄이 구분선일 때만 표로 인정
+    const next = lines[i + 1];
+    if (line.indexOf('|') >= 0 && next && next.indexOf('|') >= 0
+        && /^[\s|:-]*-[\s|:-]*$/.test(next)) {
+      flushAll();
+      const align = mdCells(next).map(c =>
+        /^:.*:$/.test(c) ? 'center' : /:$/.test(c) ? 'right' : '');
+      const head = mdCells(line);
+      const body = [];
+      i += 2;
+      for (; i < lines.length && lines[i].trim() && lines[i].indexOf('|') >= 0; i++)
+        body.push(mdCells(lines[i]));
+      i--;
+      out.push('<div class="tw"><table><thead>' + mdRow(head, align, 'th')
+        + '</thead><tbody>' + body.map(r => mdRow(r, align, 'td')).join('')
+        + '</tbody></table></div>');
+      continue;
+    }
+
+    const li = line.match(/^(\s*)(?:([-*+])|(\d+)[.)])\s+(.*)$/);
+    if (li) {
+      flushPara(); flushQuote();
+      const ind = li[1].replace(/\t/g, '    ').length;
+      const tag = li[2] ? 'ul' : 'ol';
+      const cb = li[4].match(/^\[([ xX])\]\s+(.*)$/);
+      const cls = cb ? ' class="task"' : '';
+      const inner = cb
+        ? '<input type="checkbox" disabled' + (cb[1] === ' ' ? '' : ' checked') + '> '
+          + mdInline(cb[2])
+        : mdInline(li[4]);
+      while (stack.length && ind < stack[stack.length - 1].ind)
+        out.push('</li></' + stack.pop().tag + '>');
+      if (!stack.length || ind > stack[stack.length - 1].ind) {
+        stack.push({tag: tag, ind: ind});
+        out.push('<' + tag + '>');            // 열린 <li> 안에 들어가 중첩이 된다
+      } else if (stack[stack.length - 1].tag !== tag) {
+        out.push('</li></' + stack.pop().tag + '>');
+        stack.push({tag: tag, ind: ind});
+        out.push('<' + tag + '>');
+      } else {
+        out.push('</li>');
+      }
+      out.push('<li' + cls + '>' + inner);
+      continue;
+    }
+
+    // 리스트 항목에 이어지는 들여쓴 줄 — <ul> 안에 <p>를 흘리지 않는다
+    if (stack.length && /^\s{2,}\S/.test(line)) { out.push('<br>' + mdInline(line.trim())); continue; }
+
+    closeLists();
+    para.push(line);
+  }
+  flushAll();
+  return out.join('\n');
+}
+
+function md(src){
+  const B = [], S = [];
+  const s = esc(src == null ? '' : src)
+    // 여는 울타리와 같은 길이로 닫아야 ````markdown 처럼 4개짜리 펜스에서
+    // 백틱 한 개가 본문으로 새지 않는다
+    .replace(/(`{3,})(\w*)\n?([\s\S]*?)\1/g, (m0, fence, lang, code) => {
+      B.push('<pre class="cb"><code>' + code.replace(/\n$/, '') + '</code></pre>');
+      return '\u0000B' + (B.length - 1) + '\u0000';
+    })
+    .replace(/`([^`\n]+)`/g, (m0, c) => {
+      S.push('<code>' + c + '</code>');
+      return '\u0000S' + (S.length - 1) + '\u0000';
+    });
+  return mdBlocks(s.split('\n'))
+    .replace(/\u0000S(\d+)\u0000/g, (m0, k) => S[+k])
+    .replace(/\u0000B(\d+)\u0000/g, (m0, k) => B[+k]);
+}
+
+const TOOL_ARG = {
+  Bash: i => i.command, Read: i => i.file_path, Edit: i => i.file_path,
+  Write: i => i.file_path, Glob: i => i.pattern, Grep: i => i.pattern,
+  Task: i => i.description, Agent: i => i.description, Skill: i => i.skill,
+  WebFetch: i => i.url, WebSearch: i => i.query, TodoWrite: () => '',
+};
+
+function toolArg(name, input){
+  if (!input || typeof input !== 'object') return '';
+  const f = TOOL_ARG[name];
+  if (f) { const v = f(input); if (v) return String(v).split('\n')[0]; }
+  const k = ['file_path','path','command','query','pattern','description','prompt','url']
+    .find(k => typeof input[k] === 'string');
+  return k ? String(input[k]).split('\n')[0] : '';
+}
+
+function toolBody(name, input){
+  if (!input || typeof input !== 'object') return '<pre class="raw">'+esc(input)+'</pre>';
+  if (name === 'Bash' && input.command)
+    return '<pre class="raw">$ '+esc(input.command)+'</pre>'
+      + (input.description ? '<div class="sub">'+esc(input.description)+'</div>' : '');
+  return '<pre class="raw">'+esc(JSON.stringify(input, null, 2))+'</pre>';
+}
+
+function diffStats(p){
+  if (p.create) return {add: String(p.content || '').split('\n').length, del: 0};
+  let add = 0, del = 0;
+  for (const h of p.patch || []) for (const l of h.lines || []) {
+    if (l[0] === '+') add++; else if (l[0] === '-') del++;
+  }
+  return {add, del};
+}
+
+function statHtml(s){
+  return '<span class="plus">+'+s.add+'</span> <span class="minus">−'+s.del+'</span>';
+}
+
+function hunkHtml(p){
+  const rows = [];
+  const row = (cls, o, n, mark, body) =>
+    '<tr'+(cls ? ' class="'+cls+'"' : '')+'><td class="ln">'+(o || '')+'</td>'
+    + '<td class="ln">'+(n || '')+'</td><td class="dl">'+mark+' '+body+'</td></tr>';
+  if (p.create) {
+    String(p.content || '').split('\n').forEach((l, i) =>
+      rows.push(row('add', '', i + 1, '+', esc(l))));
+  } else {
+    for (const h of p.patch || []) {
+      rows.push('<tr class="hh"><td class="ln"></td><td class="ln"></td><td class="dl">'
+        + '@@ -'+h.oldStart+','+h.oldLines+' +'+h.newStart+','+h.newLines+' @@</td></tr>');
+      let o = h.oldStart, n = h.newStart;
+      for (const l of h.lines || []) {
+        const c = l[0], body = esc(l.slice(1));
+        if (c === '+') rows.push(row('add', '', n++, '+', body));
+        else if (c === '-') rows.push(row('del', o++, '', '-', body));
+        else rows.push(row('', o++, n++, '&nbsp;', body));
+      }
+    }
+  }
+  return '<table class="dt">'+rows.join('')+'</table>';
+}
+
+/* 세션 cwd 기준 상대경로. 워크트리에서는 cwd 가 곧 리포 루트라 리포 상대와 같다.
+   바깥 파일은 홈만 ~ 로 접는다. 전체 경로는 title 로 남긴다. */
+function relPath(f){
+  const meta = (window.__CCS && window.__CCS.data.meta) || {};
+  const cwd = (meta.cwd || '').replace(/\/+$/, '');
+  if (cwd && f.startsWith(cwd + '/')) return f.slice(cwd.length + 1);
+  return f.replace(/^\/Users\/[^/]+/, '~');
+}
+
+function fdHead(p){
+  const s = diffStats(p);
+  const full = p.file || '';
+  const file = relPath(full);
+  const cut = file.lastIndexOf('/') + 1;
+  return '<span class="fh-tool">'+esc(p.tool)+'</span>'
+    + '<span class="fh-path" title="'+esc(full)+'"><span class="dir">'
+    + esc(file.slice(0, cut))+'</span><b>'+esc(file.slice(cut))+'</b></span>'
+    + (p.create ? '<span class="badge">새 파일</span>' : '')
+    + (p.userModified ? '<span class="badge">수동수정</span>' : '')
+    + '<span class="fh-stat">'+statHtml(s)+'</span>';
+}
+
+function fdCard(p){
+  return '<details class="fd"><summary class="fd-h">'+fdHead(p)+'</summary>'+hunkHtml(p)+'</details>';
+}
+
+function renderPart(p){
+  if (p.hunk && window.__HIDE_HUNK) return '';  // 리뷰 마커·탭이 hunk CLI를 대신한다
+  if (p.type === 'file_diff') return fdCard(p);
+  if (p.type === 'tool_use' && (p.name === 'Edit' || p.name === 'Write'))
+    return '';  // diff 카드가 호출·결과를 대신한다
+  if (p.type === 'text')
+    return p.text ? '<div class="md">'+md(p.text)+'</div>' : '';
+  if (p.type === 'command')
+    return '<div class="cmd"><code>'+esc(p.name)+'</code>'
+      + (p.args ? ' <span class="arg">'+esc(p.args)+'</span>' : '') + '</div>';
+  if (p.type === 'ask')
+    return '<div class="ask">' + p.items.map(it =>
+      '<div class="ask-q">'
+      + (it.header ? '<span class="badge">'+esc(it.header)+'</span>' : '')
+      + esc(it.question) + '</div>'
+      + '<div class="ask-a">' + (it.answer ? esc(it.answer) : '(무응답)') + '</div>'
+    ).join('') + '</div>';
+  if (p.type === 'skill')
+    return '<details class="skill"><summary><strong>/'+esc(p.name)+'</strong>'
+      + '<span class="arg">스킬 안내</span></summary>'
+      + '<div class="body"><div class="md">'+md(p.text)+'</div></div></details>';
+  if (p.type === 'thinking')
+    return '<details class="think"><summary>사고 과정</summary><div class="body">'
+      + '<div class="md">'+md(p.text)+'</div></div></details>';
+  if (p.type === 'tool_use') {
+    const arg = toolArg(p.name, p.input);
+    return '<details class="tool"><summary><strong>'+esc(p.name)+'</strong>'
+      + (arg ? '<span class="arg">'+esc(arg)+'</span>' : '') + '</summary>'
+      + '<div class="body">'+toolBody(p.name, p.input)+'</div></details>';
+  }
+  if (p.type === 'tool_result') {
+    const n = (p.text || '').split('\n').length;
+    return '<details class="tool result'+(p.error?' err':'')+'"><summary><strong>'
+      + esc(p.error ? '오류' : '결과') + '</strong><span class="arg">'
+      + esc(p.name || '') + ' · ' + n + '줄</span></summary>'
+      + '<div class="body"><pre class="raw">'+esc(p.text)+'</pre></div></details>';
+  }
+  return '';
+}
+
+function fmtHM(ts){
+  const d = new Date(ts);
+  return isNaN(d) ? '' : String(d.getHours()).padStart(2,'0')
+    + ':' + String(d.getMinutes()).padStart(2,'0');
+}
+
+function renderEvent(e, i){
+  const isUser = e.role === 'user';
+  const hasText = e.parts.some(p => p.type === 'text' && p.text);
+  const hasCmd = e.parts.some(p => p.type === 'command');
+  const hasAsk = e.parts.some(p => p.type === 'ask');
+  const hasSkill = e.parts.some(p => p.type === 'skill');
+  const hasDiff = e.parts.some(p => p.type === 'file_diff');
+  const onlyTool = !hasText && !hasCmd && !hasAsk && !hasSkill;
+  const cls = ['ev', isUser ? 'user' : 'assistant'];
+  if (e.side) cls.push('side');
+  if (hasDiff) cls.push('has-diff');
+  else if (onlyTool) cls.push('tool-only');
+  if (e.meta) cls.push('is-meta');
+  const said = hasText || hasCmd;  // /명령도 내가 한 말이다 — 같은 카드로 낸다
+  const who = !isUser ? 'Claude'
+    : said ? '나' : hasAsk ? '질문·답변'
+    : hasSkill ? '스킬' : hasDiff ? '파일 변경' : '툴 결과';
+  const badges = [];
+  if (e.side) badges.push('<span class="badge">'
+    + (e.agent ? '서브에이전트 · '+esc(e.agent) : '서브에이전트')+'</span>');
+  if (e.skill) badges.push('<span class="badge">/'+esc(e.skill)+'</span>');
+  if (e.model) badges.push('<span class="badge">'+esc(e.model)+'</span>');
+  const ts = said && e.ts ? '<span class="ts">' + esc(fmtHM(e.ts)) + '</span>' : '';
+  const body = e.parts.map(p => renderPart(p)).join('');
+  if (!body.trim()) return '';
+  const inner = (isUser && said)
+    ? '<div class="bubble">'+body+'</div>' : body;
+  return '<div class="'+cls.join(' ')+'" data-i="'+i+'">'
+    + '<div class="who">'+who+ts+badges.join('')+'</div>'+inner+'</div>';
+}
+
+function renderTurns(evs, byEv){
+  const turns = [];
+  evs.forEach((e, i) => {
+    const last = turns[turns.length - 1];
+    if (!last || last.turn !== e.turn) turns.push({turn: e.turn, items: []});
+    turns[turns.length - 1].items.push([e, i]);
+  });
+  return turns.map(t =>
+    '<section class="turn" data-turn="'+t.turn+'">'
+    + t.items.map(([e, i]) => {
+        const ths = (byEv && byEv[i]) || [];
+        return renderEvent(e, i) + (ths.length ? rvMarker(ths) : '');
+      }).join('')+'</section>'
+  ).join('');
+}
+
+/* hunk-review 리뷰 스레드: 대화 탭에는 마커, 리뷰 탭에 스레드 카드 (06 결정) */
+
+function fdAt(loc){
+  const d = window.__CCS.data;
+  const p = loc && d.events[loc[0]] && d.events[loc[0]].parts[loc[1]];
+  return p && p.type === 'file_diff' ? p : null;
+}
+
+function rvAnchor(th){
+  const c = th.comments[0];
+  if (c && c.range) return 'L' + c.range[0];
+  if (c && c.hunk != null) return 'hunk ' + c.hunk;
+  const r = th.replies[0];
+  return r && r.line ? 'L' + r.line : '';
+}
+
+function rvHead(th, resolved){
+  const full = th.file || '';
+  const file = relPath(full);
+  const cut = file.lastIndexOf('/') + 1;
+  const anchor = rvAnchor(th);
+  const agentOnly = !th.comments.length;
+  return '<span class="badge">'+(agentOnly ? 'Claude 코멘트' : '리뷰')+'</span>'
+    + '<span class="fh-path" title="'+esc(full)+'"><span class="dir">'
+    + esc(file.slice(0, cut))+'</span><b>'+esc(file.slice(cut))+'</b></span>'
+    + (anchor ? '<span class="rv-anchor">'+esc(anchor)+'</span>' : '')
+    + (agentOnly ? '' : '<span class="rv-state '+(resolved ? 'done' : 'open')+'">'
+       + (resolved ? '응답 완료' : '응답 없음')+'</span>');
+}
+
+function rvBody(th){
+  const out = [];
+  const o = fdAt(th.origin);
+  if (o) out.push('<div class="rv-label">리뷰 대상 (직전 변경에서 복원)</div>'+fdCard(o));
+  for (const c of th.comments)
+    out.push('<div class="rv-c"><div class="who-s">나'
+      + (c.hunk != null ? ' · hunk '+c.hunk : '')
+      + (c.range ? ' · L'+c.range[0] : '')+'</div>'
+      + '<div class="md">'+md(c.body)+'</div></div>');
+  const fixes = th.fixes.map(fdAt).filter(Boolean);
+  if (fixes.length) {
+    out.push('<div class="rv-label">수정 '+fixes.length+'건</div>');
+    for (const p of fixes) out.push(fdCard(p));
+  }
+  for (const r of th.replies)
+    out.push('<div class="rv-r"><div class="sum">↳ '+esc(r.summary)
+      + (r.line ? ' <span class="rv-anchor">:'+r.line+'</span>' : '')+'</div>'
+      + (r.rationale ? '<div class="rat">'+md(r.rationale)+'</div>' : '')+'</div>');
+  return out.join('');
+}
+
+function rvCard(th){
+  const resolved = th.replies.length > 0;
+  return '<div id="rv-'+th.i+'" class="rv'+(th.comments.length ? '' : ' rv-agent')+'">'
+    + '<div class="rv-h">'+rvHead(th, resolved)+'</div>'
+    + '<div class="rv-body">'+rvBody(th)+'</div></div>';
+}
+
+function rvMarker(ths){
+  const names = ths.map(th => (th.file || '').split('/').pop());
+  const label = names.slice(0, 2).join(', ') + (names.length > 2 ? ' 외 '+(names.length-2) : '');
+  return '<div class="rv-mk" role="button" tabindex="0" data-go="rv-'+ths[0].i+'">'
+    + '리뷰 스레드 '+ths.length+'건 · <b>'+esc(label)+'</b> — 리뷰 탭에서 보기</div>';
+}
+
+function reviewPanel(reviews){
+  if (!reviews.length) return '<div class="empty">리뷰 스레드 없음</div>';
+  const byFile = new Map();
+  for (const th of reviews) {
+    if (!byFile.has(th.file)) byFile.set(th.file, []);
+    byFile.get(th.file).push(th);
+  }
+  const out = [];
+  for (const [file, ths] of byFile) {
+    out.push('<div class="rvp-f" title="'+esc(file)+'">'+esc(relPath(file))+'</div>');
+    for (const th of ths) out.push(rvCard(th));
+  }
+  return out.join('');
+}
+
+function renderSession(data, mount){
+  window.__CCS = {data, mount};
+  mount.classList.remove('empty');
+  mount.style.opacity = '0';   // "불러오는 중…" → 본문 하드컷을 없앤다 (끝에서 되돌림)
+  const evs = data.events || [];
+  const reviews = data.reviews || [];
+  reviews.forEach((th, i) => { th.i = i; });   // 마커 → 스레드 카드 앵커
+  const c = data.counts || {};
+  const box = n => document.querySelector('[data-f="'+n+'"]');
+  const toggle = (n, on) => { const el = box(n); if (el) el.closest('label').classList.toggle('hidden', !on); };
+  toggle('think', (c.thinking || 0) > 0);
+  toggle('side', (c.sidechain || 0) > 0);
+  window.__HIDE_HUNK = reviews.length > 0;
+  if (reviews.length) {
+    const byEv = {};
+    reviews.forEach(th => (byEv[th.ev] = byEv[th.ev] || []).push(th));
+    mount.innerHTML =
+      '<div class="rv-tabs"><button class="on" data-tab="conv">대화</button>'
+      + '<button data-tab="rv">리뷰 '+reviews.length+'</button><i class="ind"></i></div>'
+      + '<div id="tab-conv">'+renderTurns(evs, byEv)+'</div>'
+      + '<div id="tab-rv" class="hidden">'+reviewPanel(reviews)+'</div>';
+    // 밑줄은 CSS 변수(상속 → 자식 전체 재계산) 대신 인디케이터에 직접 transform 을 준다
+    const ind = mount.querySelector('.rv-tabs .ind');
+    const place = () => {
+      const on = mount.querySelector('.rv-tabs button.on');
+      if (!on) return;
+      ind.style.width = on.offsetWidth + 'px';
+      ind.style.transform = 'translateX(' + on.offsetLeft + 'px)';
+    };
+    const pick = tab => {
+      mount.querySelectorAll('.rv-tabs button').forEach(x =>
+        x.classList.toggle('on', x.dataset.tab === tab));
+      document.getElementById('tab-conv').classList.toggle('hidden', tab !== 'conv');
+      document.getElementById('tab-rv').classList.toggle('hidden', tab !== 'rv');
+      place();
+    };
+    mount.querySelectorAll('.rv-tabs button').forEach(b => {
+      b.onclick = () => pick(b.dataset.tab);
+    });
+    // 마커는 "리뷰 탭 맨 위"가 아니라 그 스레드로 데려가야 한다 — 공간 연속성
+    mount.querySelectorAll('.rv-mk').forEach(mk => {
+      const go = () => {
+        pick('rv');
+        const t = document.getElementById(mk.dataset.go);
+        if (!t) { window.scrollTo({top: 0, behavior: SCROLL_BEHAVIOR()}); return; }
+        t.scrollIntoView({behavior: SCROLL_BEHAVIOR(), block: 'center'});
+        mount.querySelectorAll('.rv.flash').forEach(x => x.classList.remove('flash'));
+        void t.offsetWidth;                       // 연속 클릭에도 다시 재생되게
+        t.classList.add('flash');
+        t.addEventListener('animationend',
+          () => t.classList.remove('flash'), {once: true});
+      };
+      mk.onclick = go;
+      mk.onkeydown = e => {
+        if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); go(); }
+      };
+    });
+    ind.style.transition = 'none';                // 첫 배치는 움직이지 않는다
+    place();
+    requestAnimationFrame(() => { ind.style.transition = ''; });
+    addEventListener('resize', place);
+  } else {
+    mount.innerHTML = renderTurns(evs);
+  }
+  // 그룹핑 → 필터 → 항해 장치 순서. 필터는 버스트를 통째로 껐다 켜므로 그룹핑 뒤라야 하고,
+  // 항해 장치는 DOM 재배치가 끝난 뒤에 헤더를 승격해야 한다. (04)
+  groupAll(mount);
+  applyFilters();
+  setupNav(mount);
+  requestAnimationFrame(() => { mount.style.opacity = ''; });
+}
+
+function applyFilters(){
+  const f = name => {
+    const el = document.querySelector('[data-f="'+name+'"]');
+    return el ? el.checked : true;
+  };
+  const showTools = f('tools'), showThink = f('think'), showSide = f('side');
+  document.querySelectorAll('.burst').forEach(b =>
+    b.classList.toggle('hidden', !showTools));
+  document.querySelectorAll('.ev').forEach(ev => {
+    let hide = false;
+    if (!showTools && ev.classList.contains('tool-only')) hide = true;
+    if (!showSide && ev.classList.contains('side')) hide = true;
+    ev.classList.toggle('hidden', hide);
+    ev.querySelectorAll('details.tool').forEach(d => d.classList.toggle('hidden', !showTools));
+    ev.querySelectorAll('details.think').forEach(d => d.classList.toggle('hidden', !showThink));
+  });
+}
+
+/* ── 03 활동 버스트 압축 ────────────────────────────────────────────
+   연속 활동 버스트(활동 3건 이상)를 접힌 요약 한 줄로 강등한다.
+   렌더 결과 위에 얹는 후처리라 renderPart/renderEvent는 무변경. */
+
+const CAT = {
+  탐색: ['Read','Glob','Grep','WebFetch','WebSearch','ToolSearch','NotebookRead','LSP'],
+  실행: ['Bash','BashOutput','KillShell'],
+  위임: ['Task','Agent','Skill','Workflow'],
+  변경: ['Edit','Write','NotebookEdit'],   // 성공분은 diff 카드가 되고, 실패분만 여기 남는다
+};
+const CAT_ORDER = ['탐색','실행','위임','기타'];
+const MIN_ITEMS = 3;   // 활동 3건 미만은 묶지 않는다 (버스트의 17~30%가 도구 1개 — 실측)
+const TEXTY = new Set(['text','command','ask','skill']);
+
+function catOf(name){
+  for (const c of Object.keys(CAT)) if (CAT[c].includes(name)) return c;
+  return '기타';
+}
+
+function isActivityEv(ev){ return ev && !ev.parts.some(p => TEXTY.has(p.type)); }
+
+function fmtDur(ms){
+  if (!(ms > 0)) return '';
+  const s = Math.round(ms / 1000);
+  if (s < 60) return s + '초';
+  const mn = Math.floor(s / 60);
+  if (mn < 60) return mn + '분' + (s % 60 ? ' ' + (s % 60) + '초' : '');
+  return Math.floor(mn / 60) + '시간' + (mn % 60 ? ' ' + (mn % 60) + '분' : '');
+}
+
+function burstStats(els){
+  const evs = (window.__CCS && window.__CCS.data.events) || [];
+  const st = {tools: 0, cats: {}, files: new Map(), add: 0, del: 0,
+              err: 0, think: 0, t0: null, t1: null};
+  for (const el of els) {
+    const ev = evs[+el.dataset.i];
+    if (!ev) continue;
+    if (ev.ts) { st.t0 = st.t0 || ev.ts; st.t1 = ev.ts; }
+    for (const p of ev.parts) {
+      if (p.type === 'tool_use') {
+        if (p.name === 'Edit' || p.name === 'Write') continue;  // diff 카드가 대신함
+        st.cats[catOf(p.name)] = (st.cats[catOf(p.name)] || 0) + 1;
+        st.tools++;
+      } else if (p.type === 'file_diff') {
+        const s = diffStats(p);
+        st.add += s.add; st.del += s.del;
+        st.files.set(p.file, (st.files.get(p.file) || 0) + 1);
+      } else if (p.type === 'tool_result') { if (p.error) st.err++; }
+      else if (p.type === 'thinking') st.think++;
+    }
+  }
+  st.items = st.tools + st.files.size + st.think;
+  st.ms = (st.t0 && st.t1) ? (new Date(st.t1) - new Date(st.t0)) : 0;
+  return st;
+}
+
+function burstHead(st){
+  const bits = ['<span class="b-n">활동 ' + st.items + '</span>'];
+  for (const c of CAT_ORDER) if (st.cats[c]) bits.push(c + ' ' + st.cats[c]);
+  if (st.files.size) bits.push('파일 ' + st.files.size + '개 <span class="plus">+' + st.add
+    + '</span> <span class="minus">−' + st.del + '</span>');
+  if (st.think) bits.push('사고 ' + st.think);
+  let h = bits.join('<span class="b-sep"> · </span>');
+  if (st.err) h += '<span class="b-sep"> · </span><span class="b-err">오류 ' + st.err + '</span>';
+  const d = fmtDur(st.ms);
+  return h + (d ? '<span class="b-t">' + d + '</span>' : '');
+}
+
+function makeBurst(els, st){
+  const b = document.createElement('div');
+  b.className = 'burst' + (st.err ? ' has-err' : '');
+  b.innerHTML = '<div class="burst-h" role="button" tabindex="0" aria-expanded="false">'
+    + burstHead(st) + '</div>'
+    + '<div class="burst-body" hidden="until-found"><div class="burst-in">'
+    + '<div class="b-all"><button data-x="open">모두 펼치기</button>'
+    + '<button data-x="close">모두 접기</button></div></div></div>';
+  els[0].before(b);
+  const head = b.querySelector('.burst-h');
+  const body = b.querySelector('.burst-body');
+  const inner = b.querySelector('.burst-in');
+  for (const el of els) inner.appendChild(el);   // 원본 시간순 그대로
+  // 펼침은 세션당 수십 번 — 짧게. 접기는 시스템 응답이므로 더 빠르게(비대칭).
+  // 아주 긴 버스트는 기다리는 편이 튀는 것보다 나쁘므로 애니메이션을 건너뛴다.
+  const OPEN_MS = 180, CLOSE_MS = 140, MAX_ANIM = 900;
+  let anim = null;
+  const set = (open, animate) => {
+    b.classList.toggle('open', open);
+    head.setAttribute('aria-expanded', open ? 'true' : 'false');
+    if (anim) { anim.cancel(); anim = null; }
+    if (open) body.removeAttribute('hidden');
+    const h = body.scrollHeight;
+    if (!animate || REDUCED.matches || h > MAX_ANIM) {
+      if (!open) body.setAttribute('hidden', 'until-found');
+      return;
+    }
+    anim = body.animate(
+      [{height: (open ? 0 : h) + 'px', opacity: open ? 0 : 1},
+       {height: (open ? h : 0) + 'px', opacity: open ? 1 : 0}],
+      {duration: open ? OPEN_MS : CLOSE_MS, easing: 'cubic-bezier(.23,1,.32,1)'});
+    anim.onfinish = () => {
+      anim = null;
+      if (!open) body.setAttribute('hidden', 'until-found');
+    };
+  };
+  head.onclick = () => set(!b.classList.contains('open'), true);
+  head.onkeydown = e => {
+    if (e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault(); set(!b.classList.contains('open'), true);
+    }
+  };
+  // 브라우저 Ctrl+F가 접힌 안을 찾아 펼칠 때 요약 줄의 상태도 맞춘다 (04 ⑤)
+  // 찾기 결과로 튀어나오는 것이지 사용자가 연 게 아니므로 애니메이션은 없다.
+  body.addEventListener('beforematch', () => set(true, false));
+  inner.querySelector('[data-x=open]').onclick =
+    () => inner.querySelectorAll('details').forEach(d => d.open = true);
+  inner.querySelector('[data-x=close]').onclick =
+    () => inner.querySelectorAll('details').forEach(d => d.open = false);
+  return b;
+}
+
+function groupAll(mount){
+  const evs = (window.__CCS && window.__CCS.data.events) || [];
+  for (const turn of mount.querySelectorAll('.turn')) {
+    let run = [];
+    const flush = () => {
+      if (run.length) {
+        const st = burstStats(run);
+        if (st.items >= MIN_ITEMS) makeBurst(run, st);
+      }
+      run = [];
+    };
+    for (const k of Array.from(turn.children)) {
+      const ok = k.classList && k.classList.contains('ev') && !k.classList.contains('side')
+        && isActivityEv(evs[+k.dataset.i]);
+      if (ok) run.push(k); else flush();
+    }
+    flush();
+  }
+}
+
+/* ── 04 항해 장치 ───────────────────────────────────────────────────
+   ① 턴을 여는 지시 카드 헤더만 sticky  ② 붙어 있는 동안만 지시 축약 표기
+   ③ 2px 진행바 + 턴 눈금(클릭 점프·hover 라벨) — 이 눈금이 목차를 흡수한다
+   ④ 턴 정의는 parse_session이 좁혀 넘긴 값(진짜 지시만)을 그대로 쓴다 */
+
+const NAV = {turns: [], hh: 0, raf: 0, lraf: 0, bound: false};
+
+function headerH(){
+  const hd = document.querySelector('header');
+  return hd ? Math.round(hd.getBoundingClientRect().height) : 0;
+}
+
+const OPENER_SEL = ':scope > .bubble > .md, :scope > .bubble > .cmd';
+
+function turnOpener(sec){
+  const kids = [...sec.children].filter(el => el.classList
+    && el.classList.contains('ev') && el.classList.contains('user')
+    && !el.classList.contains('side'));
+  // 본문 있는 발화가 1순위 (04, opens_turn과 같은 정의)
+  for (const el of kids) if (el.querySelector(':scope > .bubble > .md')) return el;
+  // 슬래시 커맨드로만 시작한 세션(턴 0)도 항해 장치를 갖게 한다 — 실측상 이런 세션은
+  // 첫 3,000px 에 진행바·눈금·sticky 가 통째로 없었다. /clear 류 잡음만 제외한다.
+  for (const el of kids) {
+    const c = el.querySelector(':scope > .bubble > .cmd');
+    if (c && !/^\/(clear|compact|resume|exit)\b/.test(c.textContent.trim())) return el;
+  }
+  return null;
+}
+
+function setupNav(mount){
+  const hd = document.querySelector('header');
+  if (!hd || !mount) return;
+  const old = document.getElementById('prog');
+  if (old) old.remove();
+  NAV.turns = [];
+
+  const bar = document.createElement('div');
+  bar.id = 'prog';
+  bar.innerHTML = '<div id="progfill"></div><div id="progtip"></div>';
+  hd.appendChild(bar);
+  const fill = bar.querySelector('#progfill');
+  const tip = bar.querySelector('#progtip');
+
+  mount.querySelectorAll('.turn').forEach(sec => {
+    const op = turnOpener(sec);
+    if (!op) return;
+    const src = op.querySelector(OPENER_SEL);
+    NAV.turns.push({sec: sec, op: op,
+      label: (src ? src.textContent : '').trim().replace(/\s+/g, ' ')});
+  });
+  const total = NAV.turns.length;
+  if (!total) return;
+
+  NAV.turns.forEach((t, i) => {
+    t.op.classList.add('turn-open');
+    // 지시 헤더를 카드 밖으로 승격 — sticky 범위를 턴 전체로 넓힌다 (04 ①)
+    const who = t.op.querySelector(':scope > .who');
+    if (who) {
+      // 시각(.ts)과 지시요약(.tnav)을 같은 grid cell 에 겹쳐 넣는다 — display 스위치가
+      // 아니라 opacity 교체가 되고, 행 너비가 붙는 순간마다 튀지 않는다 (04 ②)
+      const swap = document.createElement('span');
+      swap.className = 'swap';
+      const ts = who.querySelector(':scope > .ts');
+      const s = document.createElement('span');
+      s.className = 'tnav';
+      s.innerHTML = '<b>' + (i + 1) + '/' + total + '</b> · ' + esc(t.label.slice(0, 140));
+      if (ts) swap.appendChild(ts);
+      swap.appendChild(s);
+      who.appendChild(swap);
+      who.classList.add('turn-head');
+      t.op.before(who);
+      t.head = who;
+    }
+    const label = (i + 1) + '. ' + (t.label.slice(0, 140) || '(빈 지시)');
+    const tick = document.createElement('button');
+    tick.type = 'button';
+    tick.className = 'tick';
+    tick.setAttribute('aria-label', label);
+    const show = () => {
+      tip.textContent = label;
+      tip.classList.add('on');
+      const x = parseFloat(tick.style.left) || 0;
+      tip.style.left =
+        Math.max(8, Math.min(x - 24, bar.clientWidth - tip.offsetWidth - 8)) + 'px';
+    };
+    const hide = () => tip.classList.remove('on');
+    tick.onclick = () =>
+      t.sec.scrollIntoView({behavior: SCROLL_BEHAVIOR(), block: 'start'});
+    tick.onmouseenter = show;
+    tick.onmouseleave = hide;
+    tick.onfocus = show;
+    tick.onblur = hide;
+    bar.appendChild(tick);
+    t.tick = tick;
+  });
+
+  const scrollMax = () =>
+    Math.max(1, document.documentElement.scrollHeight - window.innerHeight);
+
+  const layout = () => {
+    const hh = headerH();
+    document.documentElement.style.setProperty('--hh', hh + 'px');
+    NAV.hh = hh;
+    const w = bar.clientWidth || 1, max = scrollMax();
+    let prev = -99;
+    for (const t of NAV.turns) {
+      const top = t.sec.getBoundingClientRect().top + window.scrollY - hh - 12;
+      let x = Math.min(1, Math.max(0, top / max)) * w;
+      if (x - prev < 7) x = prev + 7;   // 최대 43턴 — 눈금이 겹치지 않게 최소 간격 클램프
+      prev = x = Math.min(x, w - 6);    // 눈금 반폭만큼 남겨 문서 가로 스크롤을 만들지 않는다
+      t.tick.style.left = x + 'px';
+    }
+  };
+  NAV.layout = layout;
+
+  // 진행 채움 + stuck 판정. IntersectionObserver sentinel은 눈금 클릭 같은 즉시 점프에서
+  // 경계 통과 프레임이 통째로 건너뛰어져 콜백이 안 오므로, 스크롤마다 직접 잰다. (04 ②)
+  const paint = () => {
+    NAV.raf = 0;
+    const hh = NAV.hh;
+    fill.style.width = (Math.min(1, window.scrollY / scrollMax()) * 100) + '%';
+    for (const t of NAV.turns) {
+      if (!t.head) continue;
+      const r = t.sec.getBoundingClientRect();
+      t.head.classList.toggle('stuck', r.top < hh - 1 && r.bottom > hh);
+    }
+  };
+
+  if (!NAV.bound) {
+    NAV.bound = true;
+    addEventListener('scroll', () => {
+      if (!NAV.raf) NAV.raf = requestAnimationFrame(paint);
+    }, {passive: true});
+    addEventListener('resize', () => navRelayout());
+    if (window.ResizeObserver) new ResizeObserver(() => navRelayout()).observe(document.body);
+  }
+  layout();
+  paint();
+}
+
+function navRelayout(){
+  if (NAV.lraf || !NAV.layout) return;
+  NAV.lraf = requestAnimationFrame(() => { NAV.lraf = 0; NAV.layout(); });
+}
+
+document.addEventListener('change', e => {
+  if (e.target.matches('[data-f]')) applyFilters();
+});
+"""
+
+
+def page(title, body, extra_js=""):
+    return (
+        "<!doctype html><html lang=ko><head><meta charset=utf-8>"
+        '<meta name=viewport content="width=device-width,initial-scale=1">'
+        "<title>%s</title><style>%s</style></head><body>%s"
+        "<script>%s\n%s</script></body></html>"
+        % (html.escape(title), VIEWER_CSS, body, VIEWER_JS, extra_js)
+    )
+
+
+FILTERS_HTML = (
+    '<div class="filters">'
+    '<label><input type=checkbox data-f=tools checked> 활동</label>'
+    '<label><input type=checkbox data-f=think checked> 사고</label>'
+    '<label><input type=checkbox data-f=side checked> 서브에이전트</label>'
+    "</div>"
+)
+
+
+def fmt_size(n):
+    if n > 1048576:
+        return "%.1f MB" % (n / 1048576.0)
+    if n > 1024:
+        return "%.0f KB" % (n / 1024.0)
+    return "%d B" % n
+
+
+def fmt_time(ts):
+    if not ts:
+        return ""
+    try:
+        return datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone().strftime(
+            "%Y-%m-%d %H:%M"
+        )
+    except ValueError:
+        return ts[:16]
+
+
+# -------------------------------------------------------------------- serve
+
+
+class Handler(BaseHTTPRequestHandler):
+    dirs = []
+
+    def log_message(self, *a):
+        pass
+
+    def _send(self, code, ctype, payload):
+        if isinstance(payload, str):
+            payload = payload.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        try:
+            self.wfile.write(payload)
+        except BrokenPipeError:
+            pass
+
+    def do_GET(self):
+        path = unquote(urlparse(self.path).path)
+        if path == "/":
+            return self._send(200, "text/html; charset=utf-8", self.index())
+        m = re.match(r"^/s/([\w.-]+)$", path)
+        if m:
+            return self.session_page(m.group(1))
+        m = re.match(r"^/api/session/([\w.-]+)$", path)
+        if m:
+            s = self.find(m.group(1))
+            if not s:
+                return self._send(404, "application/json", '{"error":"not found"}')
+            data = parse_session(s["path"])
+            return self._send(
+                200,
+                "application/json; charset=utf-8",
+                json.dumps(data, ensure_ascii=False),
+            )
+        self._send(404, "text/plain; charset=utf-8", "not found")
+
+    def find(self, sid):
+        for s in scan_sessions(self.dirs):
+            if s["id"] == sid or s["id"].startswith(sid):
+                return s
+        return None
+
+    def index(self):
+        sessions = scan_sessions(self.dirs)
+        groups = group_sessions(sessions)
+        grouped = len(groups) > 1
+
+        def rows(ss, label=""):
+            out = []
+            for s in ss:
+                meta = [fmt_time(s["started"] or ""), fmt_size(s["size"])]
+                if s["branch"]:
+                    meta.append(s["branch"])
+                if s.get("wt"):
+                    meta.append("워크트리 · " + s["wt"])
+                if not grouped and len(self.dirs) > 1:
+                    meta.append(s["project"])
+                out.append(
+                    '<li data-q="%s"><a href="/s/%s"><div class="t">%s</div>'
+                    '<div class="m">%s</div></a></li>'
+                    % (
+                        html.escape(
+                            " ".join(
+                                [s["title"], s["branch"], s.get("wt", ""), label]
+                            ).lower()
+                        ),
+                        s["id"],
+                        html.escape(s["title"]),
+                        "".join("<span>%s</span>" % html.escape(x) for x in meta),
+                    )
+                )
+            return "".join(out)
+
+        if grouped:
+            listing = "".join(
+                '<details class="grp" data-path="%s"><summary>%s'
+                '<span class="cnt">%d</span></summary><ul class="list">%s</ul>'
+                "</details>"
+                % (
+                    html.escape(g["label"]),
+                    html.escape(g["label"]),
+                    len(g["sessions"]),
+                    rows(g["sessions"], g["label"]),
+                )
+                for g in groups
+            )
+        else:
+            listing = '<ul class="list">%s</ul>' % rows(sessions)
+        body = (
+            "<header><h1>Claude Code 세션</h1>"
+            '<span class="sub">%d개</span>'
+            '<div class="filters">'
+            '<input type=search id=q placeholder="제목·브랜치%s 검색  ( / )"></div>'
+            "</header>"
+            '<div class="wrap">%s%s</div>'
+            % (
+                len(sessions),
+                "·경로" if grouped else "",
+                listing,
+                '<div class="empty">세션 없음</div>' if not sessions else "",
+            )
+        )
+        js = """
+        const q = document.getElementById('q');
+        const KEY = 'ccs-expanded';
+        const stored = () => {
+          try { return new Set(JSON.parse(localStorage.getItem(KEY) || '[]')); }
+          catch (e) { return new Set(); }
+        };
+        let searching = false;
+        document.querySelectorAll('details.grp').forEach(d => {
+          if (stored().has(d.dataset.path)) d.open = true;
+          d.addEventListener('toggle', () => {
+            if (searching) return;
+            const s = stored();
+            d.open ? s.add(d.dataset.path) : s.delete(d.dataset.path);
+            localStorage.setItem(KEY, JSON.stringify([...s]));
+          });
+        });
+        // 하루에도 수십 번 여는 목록이다 — 검색은 키보드로 바로 잡되 애니메이션은 없다
+        addEventListener('keydown', e => {
+          const t = document.activeElement;
+          const typing = t && /^(INPUT|TEXTAREA)$/.test(t.tagName);
+          if (e.key === '/' && !typing && !e.metaKey && !e.ctrlKey) {
+            e.preventDefault(); q.focus(); q.select();
+          } else if (e.key === 'Escape' && t === q) {
+            if (q.value) { q.value = ''; q.dispatchEvent(new Event('input')); }
+            else q.blur();
+          }
+        });
+        q && q.addEventListener('input', () => {
+          const v = q.value.trim().toLowerCase();
+          searching = !!v;
+          document.body.classList.add('searching');
+          document.querySelectorAll('.list li').forEach(li =>
+            li.classList.toggle('hidden', !!v && !li.dataset.q.includes(v)));
+          const open = v ? null : stored();   // 키 입력마다 localStorage 를 다시 파싱하지 않는다
+          document.querySelectorAll('details.grp').forEach(d => {
+            const any = [...d.querySelectorAll('li')]
+              .some(li => !li.classList.contains('hidden'));
+            d.classList.toggle('hidden', !!v && !any);
+            d.open = v ? true : open.has(d.dataset.path);
+          });
+          void document.body.offsetHeight;   // 여기까지를 전환 없이 확정시킨 뒤 되돌린다
+          document.body.classList.remove('searching');
+        });
+        """
+        return page("Claude Code 세션", body, js)
+
+    def session_page(self, sid):
+        s = self.find(sid)
+        if not s:
+            return self._send(404, "text/plain; charset=utf-8", "세션 없음")
+        body = (
+            "<header><a href='/' class='sub'>← 목록</a><h1>%s</h1>"
+            '<span class="sub">%s</span>%s</header>'
+            '<div class="wrap"><div id=app class="empty">불러오는 중…</div></div>'
+            % (
+                html.escape(s["title"]),
+                html.escape(
+                    " · ".join(x for x in [fmt_time(s["started"]), s["branch"]] if x)
+                ),
+                FILTERS_HTML,
+            )
+        )
+        js = (
+            "fetch('/api/session/%s').then(r=>r.json()).then(d=>"
+            "renderSession(d, document.getElementById('app')));" % s["id"]
+        )
+        self._send(200, "text/html; charset=utf-8", page(s["title"], body, js))
+
+
+def cmd_serve(args):
+    dirs = resolve_dirs(args)
+    Handler.dirs = dirs
+    socketserver.TCPServer.allow_reuse_address = True
+    port = args.port
+    for attempt in range(20):
+        try:
+            httpd = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+            break
+        except OSError:
+            port += 1
+    else:
+        sys.exit("빈 포트를 찾지 못했습니다.")
+    url = "http://127.0.0.1:%d/" % port
+    n = len(scan_sessions(dirs))
+    print("세션 %d개 · %s" % (n, url))
+    print("종료: Ctrl+C")
+    if not args.no_open:
+        threading.Timer(0.4, lambda: webbrowser.open(url)).start()
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        print("\n종료")
+
+
+# ------------------------------------------------------------------- export
+
+
+def cmd_export(args):
+    dirs = resolve_dirs(args)
+    target = None
+    for s in scan_sessions(dirs):
+        if s["id"] == args.id or s["id"].startswith(args.id):
+            target = s
+            break
+    if not target:
+        sys.exit("세션을 찾지 못했습니다: %s" % args.id)
+
+    data = parse_session(target["path"], redact=not args.no_redact)
+    title = target["title"]
+    body = (
+        "<header><h1>%s</h1><span class='sub'>%s</span>%s</header>"
+        '<div class="wrap"><div id=app></div></div>'
+        % (
+            html.escape(title),
+            html.escape(
+                " · ".join(
+                    x for x in [fmt_time(target["started"]), target["branch"]] if x
+                )
+            ),
+            FILTERS_HTML,
+        )
+    )
+    # 세션 본문에 </script> 가 들어 있으면 인라인 스크립트가 거기서 끊긴다.
+    js = "const DATA=%s;renderSession(DATA, document.getElementById('app'));" % (
+        json.dumps(data, ensure_ascii=False).replace("</", "<\\/")
+    )
+    out = args.out or ("%s.html" % target["id"][:8])
+    with open(out, "w", encoding="utf-8") as f:
+        f.write(page(title, body, js))
+    size = os.path.getsize(out)
+    print("%s (%s)" % (out, fmt_size(size)))
+    print(
+        "  프롬프트 %d · 응답 %d · 툴 %d%s"
+        % (
+            data["counts"]["user"],
+            data["counts"]["assistant"],
+            data["counts"]["tool"],
+            "" if args.no_redact else " · 홈 경로 redact 적용",
+        )
+    )
+
+
+def cmd_list(args):
+    dirs = resolve_dirs(args)
+    sessions = scan_sessions(dirs)
+    for s in sessions:
+        print(
+            "%-10s %-16s %8s  %s"
+            % (
+                s["id"][:8],
+                fmt_time(s["started"]),
+                fmt_size(s["size"]),
+                s["title"][:70],
+            )
+        )
+    print("\n총 %d개" % len(sessions))
+
+
+def main():
+    # 서브커맨드 앞뒤 어디에 써도 먹도록 공통 옵션을 양쪽에 단다.
+    # SUPPRESS 라서 지정하지 않은 쪽이 지정한 쪽을 덮어쓰지 않는다.
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument(
+        "--dir", default=argparse.SUPPRESS, help="세션 디렉터리 직접 지정"
+    )
+    common.add_argument(
+        "-a", "--all", action="store_true", default=argparse.SUPPRESS,
+        help="모든 프로젝트 스캔",
+    )
+
+    ap = argparse.ArgumentParser(
+        prog="ccs", parents=[common], description="Claude Code 세션 뷰어"
+    )
+    ap.set_defaults(func=cmd_serve, port=8787, no_open=False)
+    sub = ap.add_subparsers(dest="cmd")
+
+    p = sub.add_parser("serve", parents=[common], help="브라우저로 열람")
+    p.add_argument("--port", type=int, default=8787)
+    p.add_argument("--no-open", action="store_true")
+    p.set_defaults(func=cmd_serve)
+
+    p = sub.add_parser("list", parents=[common], help="세션 목록 출력")
+    p.set_defaults(func=cmd_list)
+
+    p = sub.add_parser("export", parents=[common], help="공유용 HTML 저장")
+    p.add_argument("id", help="세션 id (앞부분만 써도 됨)")
+    p.add_argument("-o", "--out", help="출력 파일")
+    p.add_argument("--no-redact", action="store_true", help="홈 경로 마스킹 안 함")
+    p.set_defaults(func=cmd_export)
+
+    args = ap.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
