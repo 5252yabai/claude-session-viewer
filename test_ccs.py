@@ -1,12 +1,19 @@
 """ccs 테스트. 실행: python3 -m unittest test_ccs -v"""
 
 import contextlib
+import http.client
 import importlib.util
 import io
 import json
 import os
+import re
 import tempfile
+import threading
+import time
 import unittest
+import urllib.parse
+import urllib.request
+from http.server import ThreadingHTTPServer
 
 _spec = importlib.util.spec_from_loader(
     "ccs",
@@ -710,6 +717,56 @@ class ParseSessionSubagents(unittest.TestCase):
         self.assertEqual([e["side"] for e in data["events"]], [False])
 
 
+def noise_event(i):
+    """서브에이전트 파일 부피의 대부분 — diff 와 무관한 탐색·실행 기록."""
+    return {
+        "type": "user", "timestamp": "2026-08-01T00:00:00Z", "cwd": "/opt/x",
+        "message": {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "n%d" % i, "content": "가" * 30}]},
+    }
+
+
+def write_subagent(tmp, lines, tool_use_id="ag1"):
+    """<tmp>/s/subagents/agent-a1.jsonl 을 쓰고 세션 경로를 돌려준다."""
+    sub = os.path.join(tmp, "s", "subagents")
+    os.makedirs(sub, exist_ok=True)
+    with open(os.path.join(sub, "agent-a1.jsonl"), "w") as f:
+        for e in lines:
+            f.write(json.dumps(dict(e, isSidechain=True), ensure_ascii=False) + "\n")
+    with open(os.path.join(sub, "agent-a1.meta.json"), "w") as f:
+        json.dump({"agentType": "general-purpose", "description": "작업",
+                   "toolUseId": tool_use_id, "spawnDepth": 1}, f)
+    return os.path.join(tmp, "s.jsonl")
+
+
+class SubagentParseCost(unittest.TestCase):
+    """서브에이전트 파일에서 쓰는 건 Edit/Write diff 뿐인데 전 줄을 파싱하면
+    세션 열기가 파일 부피에 끌려간다 — 실측 최악 세션은 이 비용이 parse_session
+    의 96%(450ms/470ms)였다."""
+
+    # 무관한 줄을 파싱하면 비용이 줄 수에 끌려간다 — 판별이 서게 짧은 줄을 많이 둔다.
+    # 실측(이 형태 10.7MB): 전 줄 파싱 84ms vs 걸러낸 뒤 26ms. 임계는 그 사이.
+    NOISE = 50000
+    LIMIT = 0.05
+
+    def test_bulk_of_unrelated_lines_does_not_dominate_parse(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            lines = [noise_event(i) for i in range(self.NOISE)]
+            mid = self.NOISE // 2
+            lines[mid:mid] = [edit_use_event(), edit_result_event()]
+            path = write_subagent(tmp, lines)
+            with open(path, "w") as f:
+                f.write(json.dumps(user_text_event("부탁"), ensure_ascii=False) + "\n")
+            start = time.perf_counter()
+            data = ccs.parse_session(path)
+            elapsed = time.perf_counter() - start
+        side = [e for e in data["events"] if e["side"]]
+        self.assertEqual([p["type"] for p in side[0]["parts"]], ["file_diff"])
+        self.assertLess(
+            elapsed, self.LIMIT,
+            "무관한 줄 %d개에 %.0fms — 부피에 끌려간다" % (self.NOISE, elapsed * 1000))
+
+
 SKILL_BODY = "Base directory for this skill: /x/tdd\n\n# Test-Driven Development\n..."
 
 
@@ -964,6 +1021,138 @@ class HunkReviewThreads(unittest.TestCase):
         th = data["reviews"][0]
         self.assertEqual(th["origin"], [1, 0])
         self.assertEqual(th["fixes"], [[5, 0]])
+
+
+@contextlib.contextmanager
+def serving(dirs):
+    """진짜 서버를 띄운다 — 응답 헤더·바디까지가 사용자가 보는 경계다."""
+    ccs.Handler.dirs = dirs
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), ccs.Handler)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    try:
+        yield "http://127.0.0.1:%d" % httpd.server_address[1]
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def get(base, path):
+    with urllib.request.urlopen(base + path) as r:
+        return r.status, dict(r.headers), r.read().decode("utf-8")
+
+
+def timed_get(base, path):
+    start = time.perf_counter()
+    out = get(base, path)
+    return out, time.perf_counter() - start
+
+
+def bulky_session(tmp, sid="s", noise=SubagentParseCost.NOISE):
+    """서브에이전트가 큰 세션 하나 — 다시 읽으면 티가 난다."""
+    proj = os.path.join(tmp, "proj")
+    os.makedirs(proj, exist_ok=True)
+    lines = [noise_event(i) for i in range(noise)]
+    lines[1:1] = [edit_use_event(), edit_result_event()]
+    sub = os.path.join(proj, sid, "subagents")
+    os.makedirs(sub, exist_ok=True)
+    with open(os.path.join(sub, "agent-a1.jsonl"), "w") as f:
+        for e in lines:
+            f.write(json.dumps(dict(e, isSidechain=True), ensure_ascii=False) + "\n")
+    with open(os.path.join(sub, "agent-a1.meta.json"), "w") as f:
+        json.dump({"description": "작업", "toolUseId": "ag1"}, f)
+    path = os.path.join(proj, sid + ".jsonl")
+    with open(path, "w") as f:
+        f.write(json.dumps(user_text_event("부탁"), ensure_ascii=False) + "\n")
+    return proj, path
+
+
+class SessionResponseCache(unittest.TestCase):
+    """세션을 다시 열 때마다 파일을 통째로 다시 읽으면, 목록↔상세를 오가는
+    평범한 사용이 매번 최악 비용을 낸다. 파일이 그대로면 다시 읽지 않는다."""
+
+    def test_revisit_of_same_session_is_much_cheaper(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            proj, _ = bulky_session(tmp)
+            with serving([proj]) as base:
+                (first, _, _), t1 = timed_get(base, "/api/session/s")
+                (again, _, body), t2 = timed_get(base, "/api/session/s")
+        self.assertEqual((first, again), (200, 200))
+        self.assertEqual(len(json.loads(body)["events"]), 2)
+        self.assertLess(t2, t1 / 5, "재방문이 %.0fms → %.0fms 로만 줄었다"
+                        % (t1 * 1000, t2 * 1000))
+
+    def test_appended_session_serves_new_events(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            proj, path = bulky_session(tmp, noise=10)
+            with serving([proj]) as base:
+                get(base, "/api/session/s")
+                with open(path, "a") as f:
+                    f.write(json.dumps(
+                        user_text_event("추가 지시", ts="2026-08-01T00:01:00Z"),
+                        ensure_ascii=False) + "\n")
+                _, _, body = get(base, "/api/session/s")
+        texts = [p["text"] for e in json.loads(body)["events"] for p in e["parts"]
+                 if p["type"] == "text"]
+        self.assertEqual(texts, ["부탁", "추가 지시"])
+
+
+EMBED_RE = re.compile(
+    r'<script id="ccs-data" type="application/json">(.*?)</script>', re.S)
+
+
+class SessionPagePayload(unittest.TestCase):
+    """상세 페이지가 빈 껍데기로 오고 데이터를 다시 받아오면, 세션을 열 때마다
+    왕복 한 번과 '불러오는 중…' 구간이 생긴다. 한 응답에 실어 보낸다."""
+
+    def test_page_carries_its_events(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            proj, _ = bulky_session(tmp, noise=10)
+            with serving([proj]) as base:
+                _, _, html = get(base, "/s/s")
+        m = EMBED_RE.search(html)
+        self.assertIsNotNone(m, "상세 페이지가 데이터를 함께 싣지 않는다")
+        self.assertEqual(len(json.loads(m.group(1))["events"]), 2)
+
+    def test_markup_in_conversation_cannot_break_out_of_the_data_block(self):
+        hostile = "</script><script>window.__pwned=1</script>"
+        with tempfile.TemporaryDirectory() as tmp:
+            proj, path = bulky_session(tmp, noise=10)
+            with open(path, "a") as f:
+                f.write(json.dumps(
+                    user_text_event(hostile, ts="2026-08-01T00:01:00Z"),
+                    ensure_ascii=False) + "\n")
+            with serving([proj]) as base:
+                _, _, html = get(base, "/s/s")
+        m = EMBED_RE.search(html)
+        self.assertIsNotNone(m)
+        texts = [p["text"] for e in json.loads(m.group(1))["events"]
+                 for p in e["parts"] if p["type"] == "text"]
+        # 블록이 조기 종료됐다면 위 json.loads 가 이미 깨졌을 것이다.
+        self.assertIn(hostile, texts)                       # 내용은 그대로 살아 있고
+        self.assertNotIn("<script>window.__pwned", html)    # 태그로는 새지 않는다
+
+
+class ServerConnection(unittest.TestCase):
+    """목록↔상세를 오가는 사용은 요청이 잦다 — 요청마다 연결을 새로 맺게 두지 않는다."""
+
+    def test_one_connection_serves_several_requests(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            proj, _ = bulky_session(tmp, noise=10)
+            with serving([proj]) as base:
+                host, _, port = urllib.parse.urlsplit(base).netloc.partition(":")
+                conn = http.client.HTTPConnection(host, int(port))
+                conn.auto_open = 0      # 끊기면 조용히 새로 잇지 말고 드러나게
+                conn.connect()
+                try:
+                    codes = []
+                    for path in ("/", "/s/s", "/"):
+                        conn.request("GET", path)
+                        r = conn.getresponse()
+                        r.read()
+                        codes.append(r.status)
+                finally:
+                    conn.close()
+        self.assertEqual(codes, [200, 200, 200])
 
 
 if __name__ == "__main__":
