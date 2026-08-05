@@ -2,6 +2,7 @@
 
 import contextlib
 import importlib.util
+import io
 import json
 import os
 import tempfile
@@ -153,20 +154,194 @@ class RepoGrouping(unittest.TestCase):
         self.assertEqual(len(groups), 2)
 
 
-def write_jsonl(dirpath, sid, cwd, title, ts):
+_CACHE_TMP = None
+
+
+def setUpModule():
+    """스캔 캐시를 사용자 홈 밖으로 돌린다 — 테스트가 실제 캐시를 건드리지 않게."""
+    global _CACHE_TMP
+    _CACHE_TMP = tempfile.TemporaryDirectory()
+    os.environ["XDG_CACHE_HOME"] = _CACHE_TMP.name
+
+
+def tearDownModule():
+    os.environ.pop("XDG_CACHE_HOME", None)
+    _CACHE_TMP.cleanup()
+
+
+def cmd_prompt(name, args=""):
+    """슬래시 커맨드 프롬프트의 원문 형태."""
+    return (
+        "<command-message>%s</command-message>"
+        "<command-name>%s</command-name>"
+        "<command-args>%s</command-args>" % (name.lstrip("/"), name, args)
+    )
+
+
+def write_jsonl(dirpath, sid, cwd, title, ts, extra=(), ai_titles=(), pr=0):
     os.makedirs(dirpath, exist_ok=True)
-    line = {
-        "type": "user", "timestamp": ts, "cwd": cwd,
-        "message": {"role": "user", "content": title},
-    }
+    lines = [
+        {"type": "user", "timestamp": ts, "cwd": cwd,
+         "message": {"role": "user", "content": t}}
+        for t in [title] + list(extra)
+    ]
+    lines += [{"type": "ai-title", "aiTitle": t, "sessionId": sid} for t in ai_titles]
+    if pr:
+        lines.append({"type": "pr-link", "sessionId": sid, "prNumber": pr,
+                      "prUrl": "https://github.com/o/r/pull/%d" % pr})
     with open(os.path.join(dirpath, sid + ".jsonl"), "w") as f:
-        f.write(json.dumps(line) + "\n")
+        f.write("".join(json.dumps(x) + "\n" for x in lines))
 
 
 def render_index(dirs):
     h = ccs.Handler.__new__(ccs.Handler)
     h.dirs = dirs
     return ccs.Handler.index(h)
+
+
+def one(dirpath, **kw):
+    """세션 하나를 쓰고 scan_sessions 요약 dict 를 돌려준다."""
+    base = {"sid": "s1", "cwd": "/opt/x", "title": "제목",
+            "ts": "2026-08-01T00:00:00Z"}
+    base.update(kw)
+    write_jsonl(dirpath, base.pop("sid"), base.pop("cwd"), base.pop("title"),
+                base.pop("ts"), **base)
+    return ccs.scan_sessions([dirpath])[0]
+
+
+class SessionTitle(unittest.TestCase):
+    def test_ai_title_beats_first_prompt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            s = one(tmp, title=cmd_prompt("/model", "opus"),
+                    ai_titles=["API 교체 필요 페이지 분류 문서 작성"])
+        self.assertEqual(s["title"], "API 교체 필요 페이지 분류 문서 작성")
+
+    def test_last_ai_title_wins(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            s = one(tmp, ai_titles=["첫 제목", "고쳐 쓴 제목"])
+        self.assertEqual(s["title"], "고쳐 쓴 제목")
+
+    def test_falls_back_to_prompt_without_ai_title(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            s = one(tmp, title="토글 열고 닫을 때 헤더가 깜빡인다")
+        self.assertEqual(s["title"], "토글 열고 닫을 때 헤더가 깜빡인다")
+
+    def test_slash_command_becomes_badge_not_title(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            s = one(tmp, title=cmd_prompt("/mattpocock-skills:wayfinder", "지도 그리기"))
+        self.assertEqual(s["badge"], "wayfinder")
+        self.assertEqual(s["title"], "지도 그리기")
+
+    def test_at_path_argument_keeps_basename_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            s = one(tmp, title=cmd_prompt("/wayfinder", "@/private/tmp/x/handoff.md 이어서"))
+        self.assertEqual(s["title"], "@handoff.md 이어서")
+
+    def test_image_reference_dropped_from_title(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            s = one(tmp, title="[Image #3] [Image #4] 토글 헤더 깜빡임 수정")
+        self.assertEqual(s["title"], "토글 헤더 깜빡임 수정")
+
+    def test_control_command_skips_to_next_prompt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            s = one(tmp, title=cmd_prompt("/clear"), extra=["세션 뷰어 제목 고치기"])
+        self.assertEqual(s["title"], "세션 뷰어 제목 고치기")
+        self.assertEqual(s["badge"], "")
+
+    def test_badge_survives_when_ai_title_supplies_title(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            s = one(tmp, title=cmd_prompt("/pr-review", "26793"), ai_titles=["PR 리뷰 정리"])
+        self.assertEqual((s["badge"], s["title"]), ("pr-review", "PR 리뷰 정리"))
+
+    def test_no_material_yields_placeholder(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            s = one(tmp, title=cmd_prompt("/clear"))
+        self.assertEqual(s["title"], "(제목 없음)")
+
+    def test_absolute_path_prompt_is_not_mistaken_for_command(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            s = one(tmp, title="/Users/u/Desktop/plan.md 기반으로 코드 생성")
+        self.assertEqual(s["title"], "/Users/u/Desktop/plan.md 기반으로 코드 생성")
+        self.assertEqual(s["turns"], 1)
+
+    def test_export_masks_home_path_in_title(self):
+        import argparse
+        with tempfile.TemporaryDirectory() as tmp, fake_home("/Users/u"):
+            write_jsonl(tmp, "abc123", "/opt/x", "/Users/u/secret/plan.md 정리",
+                        "2026-08-01T00:00:00Z")
+            out = os.path.join(tmp, "o.html")
+            with contextlib.redirect_stdout(io.StringIO()):
+                ccs.cmd_export(argparse.Namespace(
+                    dir=tmp, all=False, id="abc123", out=out, no_redact=False))
+            with open(out, encoding="utf-8") as f:
+                body = f.read()
+        self.assertIn("<title>~/secret/plan.md 정리</title>", body)
+
+
+class SessionMeta(unittest.TestCase):
+    def test_turn_count_matches_opens_turn_definition(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            s = one(tmp, title="첫 지시", extra=[
+                cmd_prompt("/clear"),                      # 커맨드는 턴을 열지 않는다
+                "<system-reminder>주입</system-reminder>",  # 시스템 주입도 아니다
+                "[Request interrupted by user]",           # 중단 메시지도 아니다
+                "둘째 지시",
+            ])
+        self.assertEqual(s["turns"], 2)
+
+    def test_pr_number_from_pr_link_entry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            s = one(tmp, pr=36441)
+        self.assertEqual(s["pr"], 36441)
+
+    def test_no_pr_link_means_no_badge(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            s = one(tmp)
+        self.assertFalse(s["pr"])
+
+
+class ScanCache(unittest.TestCase):
+    def sample(self, tmp):
+        write_jsonl(tmp, "s1", "/opt/x", cmd_prompt("/wayfinder", "지도"),
+                    "2026-08-01T00:00:00Z", extra=["둘째 지시"], ai_titles=["요약 제목"],
+                    pr=42)
+        return ccs.scan_sessions([tmp])
+
+    def test_cold_and_warm_scans_agree(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cold = self.sample(tmp)
+            warm = ccs.scan_sessions([tmp])
+        self.assertEqual(cold, warm)
+
+    def test_result_identical_without_cache_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            warm = self.sample(tmp)
+            os.remove(ccs.cache_path())
+            self.assertEqual(ccs.scan_sessions([tmp]), warm)
+
+    def test_corrupt_cache_is_ignored(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            good = self.sample(tmp)
+            with open(ccs.cache_path(), "w") as f:
+                f.write("{ 깨진 json")
+            self.assertEqual(ccs.scan_sessions([tmp]), good)
+
+    def test_version_mismatch_is_ignored(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            good = self.sample(tmp)
+            with open(ccs.cache_path(), "w") as f:
+                json.dump({"v": ccs.CACHE_VERSION + 99, "sessions": {}}, f)
+            self.assertEqual(ccs.scan_sessions([tmp]), good)
+
+    def test_appended_session_is_rescanned(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.sample(tmp)
+            path = os.path.join(tmp, "s1.jsonl")
+            with open(path, "a") as f:
+                f.write(json.dumps(
+                    {"type": "ai-title", "aiTitle": "새 제목", "sessionId": "s1"}) + "\n")
+            os.utime(path, (0, 0))  # mtime 이 바뀌면 캐시가 무효다
+            self.assertEqual(ccs.scan_sessions([tmp])[0]["title"], "새 제목")
 
 
 class IndexHtml(unittest.TestCase):
@@ -201,6 +376,72 @@ class IndexHtml(unittest.TestCase):
         self.assertIn("첫 작업", html_out)
         self.assertNotIn('<details class="grp"', html_out)
         self.assertNotIn("/opt/alpha", html_out)
+
+    def test_command_badge_renders_apart_from_title(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = os.path.join(tmp, "proj")
+            write_jsonl(d, "s1", "/opt/alpha", cmd_prompt("/x:wayfinder", "지도 그리기"),
+                        "2026-08-01T00:00:00Z")
+            html_out = render_index([d])
+        self.assertIn('<div class="t"><span class="cmd">wayfinder</span>지도 그리기</div>',
+                      html_out)
+
+    def test_search_index_covers_title_badge_and_pr(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = os.path.join(tmp, "proj")
+            write_jsonl(d, "s1", "/opt/alpha", cmd_prompt("/x:wayfinder", "무시"),
+                        "2026-08-01T00:00:00Z", ai_titles=["헤더 깜빡임 수정"], pr=42)
+            row = render_index([d]).split('data-q="')[1].split('"')[0]
+        for token in ("깜빡임", "wayfinder", "#42", "alpha"):
+            self.assertIn(token, row)
+
+    def test_meta_shows_turns_and_pr_instead_of_size(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = os.path.join(tmp, "proj")
+            write_jsonl(d, "s1", "/opt/alpha", "첫 지시", "2026-08-01T00:00:00Z",
+                        extra=["둘째 지시"], pr=42)
+            html_out = render_index([d])
+        self.assertIn("<span>2턴</span>", html_out)
+        self.assertIn('<span class="pr">#42</span>', html_out)
+        self.assertNotIn(" KB</span>", html_out)
+
+    def test_project_shown_only_when_it_distinguishes_rows(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = os.path.join(tmp, "proj")
+            repo = git_repo(os.path.join(tmp, "alpha"))
+            wt = git_worktree(os.path.join(tmp, "beta"), repo, "beta")
+            write_jsonl(d, "s1", repo, "첫 작업", "2026-08-01T00:00:00Z")
+            same = render_index([d])           # 프로젝트 1종 → 표기 없음
+            write_jsonl(d, "s2", wt, "둘째 작업", "2026-08-02T00:00:00Z")
+            mixed = render_index([d])          # 같은 repo 그룹, 프로젝트 2종 → 표기
+        self.assertNotIn("<span>alpha</span>", same)
+        self.assertIn("<span>alpha</span>", mixed)
+        self.assertIn("<span>beta</span>", mixed)
+
+    def test_older_session_shows_absolute_date(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = os.path.join(tmp, "proj")
+            write_jsonl(d, "s1", "/opt/alpha", "옛 작업", "2020-03-09T00:00:00Z")
+            html_out = render_index([d])
+        self.assertIn("<span>2020-03-09</span>", html_out)
+
+
+class TurnCount(unittest.TestCase):
+    def test_list_and_detail_agree_on_turn_count(self):
+        events = [
+            user_text_event("첫 지시"),
+            user_text_event(cmd_prompt("/clear")),
+            user_text_event("<system-reminder>주입</system-reminder>"),
+            user_text_event("This session is being continued from a previous one"),
+            user_text_event("둘째 지시"),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "s.jsonl")
+            with open(path, "w") as f:
+                f.write("".join(json.dumps(e) + "\n" for e in events))
+            detail = ccs.parse_session(path)
+            self.assertEqual(ccs.count_turns(path),
+                             max(e["turn"] for e in detail["events"]))
 
 ASK_INPUT = {
     "questions": [
@@ -398,6 +639,14 @@ class ParseSessionTurns(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             data = parse_events(tmp, events)
         self.assertEqual([e["turn"] for e in data["events"]][-1], 2)
+
+    def test_absolute_path_prefix_still_starts_turn(self):
+        # 첫 토큰이 통째로 커맨드 이름일 때만 커맨드다 — /var/… 은 경로다
+        with tempfile.TemporaryDirectory() as tmp:
+            data = parse_events(
+                tmp, [user_text_event("/var/folders/x/handoff.md 읽고 진행")]
+            )
+        self.assertEqual([e["turn"] for e in data["events"]], [1])
 
     def test_system_reminder_prefix_still_starts_turn(self):
         events = [
