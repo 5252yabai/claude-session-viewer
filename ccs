@@ -1025,6 +1025,11 @@ a{color:var(--acc)}
 header{position:sticky;top:0;z-index:9;background:var(--bg);border-bottom:1px solid var(--line);
 padding:11px 20px;display:flex;gap:12px;align-items:baseline;flex-wrap:wrap}
 header h1{font-size:14px;margin:0;font-weight:600}
+/* 도구 이름은 CLI 에서 부르는 이름 그대로 — 서체까지 그쪽 문법을 쓴다 */
+header h1 .brand{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
+font-size:13.5px;letter-spacing:-.02em}
+/* baseline 정렬된 헤더다 — 마크는 flex 로 끼우지 않고 글줄에 앉힌다 */
+header h1 .mk{vertical-align:-3px;margin-right:6px}
 .sub{color:var(--dim);font-size:12px}
 .filters{display:flex;gap:12px;flex-wrap:wrap;margin-left:auto;font-size:12px;color:var(--dim)}
 .filters label{display:flex;gap:4px;align-items:center;cursor:pointer;user-select:none}
@@ -2184,13 +2189,34 @@ document.addEventListener('change', e => {
 """
 
 
+# 터미널 프롬프트 >_ — 16px 로 줄어도 형태가 남는 굵기만 남긴다.
+# export 한 HTML 도 self-contained 여야 하므로 파일이 아니라 data URI 로 심는다.
+ICON_SVG = (
+    "<rect width='32' height='32' rx='7.5' fill='%s'/>"
+    "<g fill='none' stroke='%s' stroke-width='3' "
+    "stroke-linecap='round' stroke-linejoin='round'>"
+    "<path d='M9.5 11.5l5 4.5-5 4.5'/><path d='M17.5 21h5.5'/></g>"
+)
+FAVICON = (
+    "<link rel=icon href=\"data:image/svg+xml,"
+    "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'>"
+    + (ICON_SVG % ("%23d97757", "%23fff"))
+    + "</svg>\">"
+)
+MARK = (
+    '<svg width=15 height=15 viewBox="0 0 32 32" aria-hidden=true class=mk>'
+    + (ICON_SVG % ("#d97757", "#fff"))
+    + "</svg>"
+)
+
+
 def page(title, body, extra_js=""):
     return (
         "<!doctype html><html lang=ko><head><meta charset=utf-8>"
         '<meta name=viewport content="width=device-width,initial-scale=1">'
-        "<title>%s</title><style>%s</style></head><body>%s"
+        "<title>%s</title>%s<style>%s</style></head><body>%s"
         "<script>%s\n%s</script></body></html>"
-        % (html.escape(title), VIEWER_CSS, body, VIEWER_JS, extra_js)
+        % (html.escape(title), FAVICON, VIEWER_CSS, body, VIEWER_JS, extra_js)
     )
 
 
@@ -2362,13 +2388,14 @@ class Handler(BaseHTTPRequestHandler):
         else:
             listing = '<ul class="list">%s</ul>' % rows(sessions)
         body = (
-            "<header><h1>Claude Code 세션</h1>"
-            '<span class="sub">%d개</span>'
+            "<header><h1>%s<span class=brand>ccs</span></h1>"
+            '<span class="sub">세션 %d개</span>'
             '<div class="filters">'
             '<input type=search id=q placeholder="제목·브랜치%s 검색  ( / )"></div>'
             "</header>"
             '<div class="wrap">%s%s</div>'
             % (
+                MARK,
                 len(sessions),
                 "·경로" if grouped else "",
                 listing,
@@ -2420,7 +2447,7 @@ class Handler(BaseHTTPRequestHandler):
           document.body.classList.remove('searching');
         });
         """
-        return page("Claude Code 세션", body, js)
+        return page("ccs — Claude Code 세션", body, js)
 
     def session_page(self, sid):
         s = self.find(sid)
